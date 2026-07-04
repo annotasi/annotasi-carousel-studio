@@ -46,6 +46,17 @@ VIDEO_DEFAULT_MOTION_PRESET = os.getenv("VIDEO_DEFAULT_MOTION_PRESET", "calm_zoo
 VIDEO_RENDER_TIMEOUT_SECONDS = float(os.getenv("VIDEO_RENDER_TIMEOUT_SECONDS", "180"))
 FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
 FFPROBE_PATH = os.getenv("FFPROBE_PATH", "ffprobe")
+CONTENT_AUDIO_DIR = Path(os.getenv("CONTENT_AUDIO_DIR", "./data/audio"))
+AUDIO_MAX_FILE_SIZE_MB = float(os.getenv("AUDIO_MAX_FILE_SIZE_MB", "50"))
+AUDIO_ALLOWED_EXTENSIONS = {
+    part.strip().lower().lstrip(".")
+    for part in os.getenv("AUDIO_ALLOWED_EXTENSIONS", "mp3,m4a,wav,ogg,oga").split(",")
+    if part.strip()
+}
+AUDIO_NORMALIZE_ENABLED = os.getenv("AUDIO_NORMALIZE_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+AUDIO_DEFAULT_FIT_MODE = os.getenv("AUDIO_DEFAULT_FIT_MODE", "trim_or_pad")
+AUDIO_RENDER_TIMEOUT_SECONDS = float(os.getenv("AUDIO_RENDER_TIMEOUT_SECONDS", "180"))
+AUDIO_OUTPUT_CODEC = os.getenv("AUDIO_OUTPUT_CODEC", "aac")
 TELEGRAM_LIMIT = int(os.getenv("TELEGRAM_MESSAGE_LIMIT", "3900"))
 SERVICE_DIR = Path(__file__).resolve().parent
 NODE_RENDERER = SERVICE_DIR / "render_png.js"
@@ -90,6 +101,11 @@ def render_id() -> str:
 def video_render_id() -> str:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
     return f"vid_{stamp}_{secrets.token_hex(4)}"
+
+
+def audio_render_id() -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+    return f"aud_{stamp}_{secrets.token_hex(4)}"
 
 
 def word_count(text: str) -> int:
@@ -230,6 +246,26 @@ class JsonContentStore:
                 if isinstance(item, dict) and item.get("videoRenderId") == item_video_render_id:
                     return item
         raise AppError(HTTPStatus.NOT_FOUND, "video_render_not_found", "Video render metadata was not found.")
+
+    def find_audio_render(self, item_audio_render_id: str) -> dict[str, Any]:
+        if not re.fullmatch(r"aud_\d{8}_[a-f0-9]{8}", item_audio_render_id):
+            raise AppError(HTTPStatus.BAD_REQUEST, "invalid_audio_render_id", "Audio render ID format is invalid.")
+        try:
+            paths = list(self.root.glob("cnt_*.json"))
+        except OSError as exc:
+            raise AppError(HTTPStatus.INTERNAL_SERVER_ERROR, "storage_failure", "Could not list content.") from exc
+        for path in paths:
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            audio_renders = record.get("audioRenders") if isinstance(record, dict) else None
+            if not isinstance(audio_renders, list):
+                continue
+            for item in audio_renders:
+                if isinstance(item, dict) and item.get("audioRenderId") == item_audio_render_id:
+                    return item
+        raise AppError(HTTPStatus.NOT_FOUND, "audio_render_not_found", "Audio render metadata was not found.")
 
 
 STORE = JsonContentStore(STORAGE_DIR)
@@ -710,6 +746,105 @@ def normalize_video_result(video_render: dict[str, Any]) -> dict[str, Any]:
     return {**video_render, "telegramMessages": format_video_for_telegram(video_render)}
 
 
+def format_audio_prepare_for_telegram(session: dict[str, Any]) -> list[str]:
+    lines = [
+        "Voiceover Mixing Mode",
+        "",
+        "Content ID:",
+        str(session.get("contentId", "")),
+        "",
+        "Audio Session ID:",
+        str(session.get("audioSessionId", "")),
+        "",
+        "Silakan kirim voice note atau file audio untuk content ID ini melalui Hermes, atau gunakan:",
+        f"/mixvoice_file {session.get('contentId', '')} <audio_file_path>",
+        "",
+        "Supported formats:",
+        ", ".join(session.get("supportedFormats", [])),
+        "",
+        "Reminder:",
+        "Gunakan suara kamu sendiri. Jangan gunakan voice cloning atau imitasi suara orang lain.",
+    ]
+    return split_telegram_message("\n".join(lines).strip())
+
+
+def format_audio_for_telegram(audio_render: dict[str, Any]) -> list[str]:
+    output_video = audio_render.get("outputVideo") if isinstance(audio_render.get("outputVideo"), dict) else {}
+    lines = [
+        "Final Video dengan Voiceover",
+        "",
+        "Content ID:",
+        str(audio_render.get("contentId", "")),
+        "",
+        "Audio Render ID:",
+        str(audio_render.get("audioRenderId", "")),
+        "",
+        "Source Video Render ID:",
+        str(audio_render.get("sourceVideoRenderId", "")),
+        "",
+        "Duration:",
+        f"{audio_render.get('finalDurationSeconds')} seconds",
+        "",
+        "Output:",
+        str(output_video.get("path") or output_video.get("filename") or "final-voiceover.mp4"),
+        "",
+        "Reminder:",
+        "Review kembali sebelum upload agar tidak salah konteks.",
+    ]
+    return split_telegram_message("\n".join(lines).strip())
+
+
+def normalize_audio_result(audio_render: dict[str, Any]) -> dict[str, Any]:
+    return {**audio_render, "telegramMessages": format_audio_for_telegram(audio_render)}
+
+
+def audio_file_exists(audio_render: dict[str, Any]) -> bool:
+    output_video = audio_render.get("outputVideo")
+    if not isinstance(output_video, dict):
+        return False
+    path = Path(str(output_video.get("path") or ""))
+    return path.exists() and path.is_file() and path.stat().st_size > 0
+
+
+def latest_completed_audio_render(
+    record: dict[str, Any],
+    *,
+    source_video_render_id: str,
+    source_audio_path: str,
+    audio_mode: str,
+    normalize_audio: bool,
+    fit_mode: str,
+) -> Optional[dict[str, Any]]:
+    audio_renders = record.get("audioRenders")
+    if not isinstance(audio_renders, list):
+        return None
+    normalized_source = str(Path(source_audio_path).resolve())
+    for item in reversed(audio_renders):
+        if not isinstance(item, dict):
+            continue
+        if (
+            item.get("status") == "completed"
+            and item.get("sourceVideoRenderId") == source_video_render_id
+            and item.get("sourceAudioPath") == normalized_source
+            and item.get("audioMode") == audio_mode
+            and item.get("normalizeAudio") == normalize_audio
+            and item.get("fitMode") == fit_mode
+            and audio_file_exists(item)
+        ):
+            return item
+    return None
+
+
+def latest_completed_video_for_audio(record: dict[str, Any]) -> Optional[dict[str, Any]]:
+    video_renders = record.get("videoRenders")
+    if not isinstance(video_renders, list):
+        return None
+    for item in reversed(video_renders):
+        if isinstance(item, dict) and item.get("status") == "completed" and video_file_exists(item):
+            return item
+    return None
+
+
 def video_file_exists(video_render: dict[str, Any]) -> bool:
     file_info = video_render.get("file")
     if not isinstance(file_info, dict):
@@ -808,6 +943,23 @@ def check_ffmpeg_available() -> None:
     LOGGER.info("ffmpeg_availability_checked")
 
 
+def check_ffprobe_available() -> None:
+    try:
+        completed = subprocess.run(
+            [FFPROBE_PATH, "-version"],
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise AppError(HTTPStatus.SERVICE_UNAVAILABLE, "ffprobe_not_found", "FFprobe is not installed or FFPROBE_PATH is invalid.") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise AppError(HTTPStatus.SERVICE_UNAVAILABLE, "ffprobe_unavailable", "FFprobe availability check timed out.") from exc
+    if completed.returncode != 0:
+        raise AppError(HTTPStatus.SERVICE_UNAVAILABLE, "ffprobe_unavailable", "FFprobe is unavailable.")
+
+
 def run_ffmpeg(args: list[str], timeout: float, failure_code: str, failure_message: str) -> None:
     try:
         completed = subprocess.run(
@@ -824,6 +976,312 @@ def run_ffmpeg(args: list[str], timeout: float, failure_code: str, failure_messa
     if completed.returncode != 0:
         detail = completed.stderr.strip().splitlines()[-1] if completed.stderr.strip() else failure_message
         raise AppError(HTTPStatus.BAD_GATEWAY, failure_code, f"{failure_message}: {detail[:300]}")
+
+
+def run_ffprobe_json(args: list[str]) -> dict[str, Any]:
+    try:
+        completed = subprocess.run(
+            args,
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise AppError(HTTPStatus.SERVICE_UNAVAILABLE, "ffprobe_not_found", "FFprobe is not installed or FFPROBE_PATH is invalid.") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise AppError(HTTPStatus.GATEWAY_TIMEOUT, "ffprobe_timeout", "FFprobe timed out.") from exc
+    if completed.returncode != 0:
+        detail = completed.stderr.strip().splitlines()[-1] if completed.stderr.strip() else "FFprobe failed."
+        raise AppError(HTTPStatus.BAD_GATEWAY, "ffprobe_failed", f"FFprobe failed: {detail[:300]}")
+    try:
+        data = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise AppError(HTTPStatus.BAD_GATEWAY, "ffprobe_invalid_json", "FFprobe returned invalid JSON.") from exc
+    if not isinstance(data, dict):
+        raise AppError(HTTPStatus.BAD_GATEWAY, "ffprobe_invalid_json", "FFprobe returned invalid JSON.")
+    return data
+
+
+def probe_media(path: Path) -> dict[str, Any]:
+    return run_ffprobe_json(
+        [
+            FFPROBE_PATH,
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration:stream=index,codec_type",
+            "-of",
+            "json",
+            str(path),
+        ]
+    )
+
+
+def media_duration_seconds(probe: dict[str, Any], field_name: str) -> float:
+    format_info = probe.get("format")
+    if not isinstance(format_info, dict):
+        raise AppError(HTTPStatus.BAD_GATEWAY, "duration_detection_failed", f"Could not detect {field_name} duration.")
+    try:
+        duration = float(format_info.get("duration"))
+    except (TypeError, ValueError) as exc:
+        raise AppError(HTTPStatus.BAD_GATEWAY, "duration_detection_failed", f"Could not detect {field_name} duration.") from exc
+    if duration <= 0:
+        raise AppError(HTTPStatus.BAD_GATEWAY, "duration_detection_failed", f"{field_name} duration is invalid.")
+    return round(duration, 3)
+
+
+def probe_has_stream(probe: dict[str, Any], stream_type: str) -> bool:
+    streams = probe.get("streams")
+    if not isinstance(streams, list):
+        return False
+    return any(isinstance(stream, dict) and stream.get("codec_type") == stream_type for stream in streams)
+
+
+def resolve_allowed_audio_path(raw_path: str) -> Path:
+    if not raw_path or "\x00" in raw_path:
+        raise AppError(HTTPStatus.BAD_REQUEST, "invalid_audio_path", "Audio file path is invalid.")
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute():
+        path = (SERVICE_DIR / path).resolve()
+    else:
+        path = path.resolve()
+    allowed_root = CONTENT_AUDIO_DIR.resolve()
+    try:
+        path.relative_to(allowed_root)
+    except ValueError as exc:
+        raise AppError(
+            HTTPStatus.BAD_REQUEST,
+            "audio_path_not_allowed",
+            f"Audio file must be inside CONTENT_AUDIO_DIR: {allowed_root}",
+        ) from exc
+    return path
+
+
+def validate_audio_file(raw_path: str) -> tuple[Path, float]:
+    LOGGER.info("audio_validation_started")
+    path = resolve_allowed_audio_path(raw_path)
+    if not path.exists() or not path.is_file():
+        raise AppError(HTTPStatus.NOT_FOUND, "audio_file_missing", "Audio file was not found.")
+    extension = path.suffix.lower().lstrip(".")
+    if extension not in AUDIO_ALLOWED_EXTENSIONS:
+        raise AppError(HTTPStatus.UNPROCESSABLE_ENTITY, "unsupported_audio_format", "Audio format is not supported.")
+    size_mb = path.stat().st_size / (1024 * 1024)
+    if size_mb > AUDIO_MAX_FILE_SIZE_MB:
+        raise AppError(HTTPStatus.UNPROCESSABLE_ENTITY, "audio_too_large", "Audio file exceeds configured size limit.")
+    probe = probe_media(path)
+    if not probe_has_stream(probe, "audio"):
+        raise AppError(HTTPStatus.UNPROCESSABLE_ENTITY, "invalid_audio_stream", "Audio file has no valid audio stream.")
+    duration = media_duration_seconds(probe, "audio")
+    LOGGER.info("audio_validation_completed duration_seconds=%s size_mb=%.2f", duration, size_mb)
+    return path, duration
+
+
+def normalize_voiceover_audio(source_path: Path, output_path: Path, video_duration: float) -> None:
+    LOGGER.info("normalization_started")
+    args = [
+        FFMPEG_PATH,
+        "-y",
+        "-i",
+        str(source_path),
+        "-t",
+        f"{video_duration:.3f}",
+        "-vn",
+        "-af",
+        "loudnorm=I=-16:TP=-1.5:LRA=11",
+        "-ar",
+        "48000",
+        "-ac",
+        "2",
+        "-c:a",
+        "pcm_s16le",
+        str(output_path),
+    ]
+    run_ffmpeg(args, AUDIO_RENDER_TIMEOUT_SECONDS, "audio_normalization_failed", "FFmpeg failed to normalize audio")
+    if not output_path.exists() or output_path.stat().st_size <= 0:
+        raise AppError(HTTPStatus.BAD_GATEWAY, "audio_normalization_failed", "Normalized audio file is missing or empty.")
+    LOGGER.info("normalization_completed")
+
+
+def mix_voiceover_video(source_video: Path, source_audio: Path, output_video: Path, video_duration: float) -> None:
+    LOGGER.info("mixing_started")
+    args = [
+        FFMPEG_PATH,
+        "-y",
+        "-i",
+        str(source_video),
+        "-i",
+        str(source_audio),
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-c:v",
+        "copy",
+        "-c:a",
+        AUDIO_OUTPUT_CODEC,
+        "-b:a",
+        "192k",
+        "-t",
+        f"{video_duration:.3f}",
+        "-movflags",
+        "+faststart",
+        str(output_video),
+    ]
+    run_ffmpeg(args, AUDIO_RENDER_TIMEOUT_SECONDS, "audio_mixing_failed", "FFmpeg failed to mix audio into video")
+    if not output_video.exists() or output_video.stat().st_size <= 0:
+        raise AppError(HTTPStatus.BAD_GATEWAY, "audio_output_missing", "Generated voiceover MP4 is missing or empty.")
+    LOGGER.info("mixing_completed")
+
+
+def write_audio_metadata(output_dir: Path, audio_render: dict[str, Any]) -> None:
+    metadata_path = output_dir / "audio-render-metadata.json"
+    try:
+        metadata_path.write_text(json.dumps(audio_render, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as exc:
+        raise AppError(HTTPStatus.INTERNAL_SERVER_ERROR, "metadata_write_failed", "Could not write audio metadata.") from exc
+
+
+def prepare_audio_session(item_id: str) -> dict[str, Any]:
+    LOGGER.info("audio_prepare_request_received content_id=%s", item_id)
+    record = STORE.get(item_id)
+    validate_renderable_content(record)
+    audio_dir = (CONTENT_AUDIO_DIR / item_id).resolve()
+    try:
+        audio_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise AppError(HTTPStatus.INTERNAL_SERVER_ERROR, "audio_directory_not_writable", "Audio directory is not writable.") from exc
+    session = {
+        "contentId": item_id,
+        "audioSessionId": audio_render_id(),
+        "status": "waiting_for_audio",
+        "supportedFormats": sorted(AUDIO_ALLOWED_EXTENSIONS),
+        "audioDirectory": str(audio_dir),
+        "createdAt": now_iso(),
+        "updatedAt": now_iso(),
+    }
+    if not isinstance(record.get("audioSessions"), list):
+        record["audioSessions"] = []
+    record["audioSessions"].append(session)
+    record["latestAudioSession"] = session
+    record["updatedAt"] = now_iso()
+    STORE.save(record)
+    return {**session, "telegramMessages": format_audio_prepare_for_telegram(session)}
+
+
+def render_content_audio_mix(item_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    audio_file_path = str(body.get("audioFilePath") or "").strip()
+    if not audio_file_path:
+        raise AppError(HTTPStatus.BAD_REQUEST, "missing_audio_file_path", "audioFilePath is required.")
+    audio_mode = str(body.get("audioMode") or "voiceover").strip()
+    normalize_audio = bool(body.get("normalizeAudio", AUDIO_NORMALIZE_ENABLED))
+    fit_mode = str(body.get("fitMode") or AUDIO_DEFAULT_FIT_MODE).strip()
+    force_regenerate = bool(body.get("forceRegenerate", False))
+
+    if audio_mode != "voiceover":
+        raise AppError(HTTPStatus.BAD_REQUEST, "unsupported_audio_mode", "Only voiceover audio mode is supported.")
+    if fit_mode != "trim_or_pad":
+        raise AppError(HTTPStatus.BAD_REQUEST, "unsupported_fit_mode", "Only trim_or_pad fit mode is supported.")
+
+    LOGGER.info("audio_mix_request_received content_id=%s mode=%s", item_id, audio_mode)
+    record = STORE.get(item_id)
+    validate_renderable_content(record)
+    LOGGER.info("content_loaded content_id=%s", item_id)
+
+    video_render = latest_completed_video_for_audio(record)
+    if not video_render:
+        raise AppError(HTTPStatus.NOT_FOUND, "video_render_not_found", "Video render not found. Run /video <content_id> first.")
+    source_video = Path(str(video_render.get("file", {}).get("path") if isinstance(video_render.get("file"), dict) else ""))
+    if not source_video.exists() or not source_video.is_file() or source_video.stat().st_size <= 0:
+        raise AppError(HTTPStatus.NOT_FOUND, "source_mp4_missing", "Source MP4 is missing. Run /video again.")
+    LOGGER.info("video_render_loaded content_id=%s video_render_id=%s", item_id, video_render.get("videoRenderId"))
+
+    check_ffmpeg_available()
+    check_ffprobe_available()
+
+    video_probe = probe_media(source_video)
+    if not probe_has_stream(video_probe, "video"):
+        raise AppError(HTTPStatus.UNPROCESSABLE_ENTITY, "invalid_source_video", "Source MP4 has no valid video stream.")
+    video_duration = media_duration_seconds(video_probe, "video")
+
+    audio_path, audio_duration = validate_audio_file(audio_file_path)
+    LOGGER.info("audio_video_durations_detected video_seconds=%s audio_seconds=%s", video_duration, audio_duration)
+
+    existing = latest_completed_audio_render(
+        record,
+        source_video_render_id=str(video_render.get("videoRenderId") or ""),
+        source_audio_path=str(audio_path),
+        audio_mode=audio_mode,
+        normalize_audio=normalize_audio,
+        fit_mode=fit_mode,
+    )
+    if existing and not force_regenerate:
+        LOGGER.info("duplicate_audio_render_returned content_id=%s audio_render_id=%s", item_id, existing.get("audioRenderId"))
+        return normalize_audio_result(existing)
+
+    item_audio_render_id = audio_render_id()
+    output_dir = (EXPORT_DIR / item_id / item_audio_render_id).resolve()
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise AppError(HTTPStatus.INTERNAL_SERVER_ERROR, "output_not_writable", "Output directory is not writable.") from exc
+
+    normalized_audio_path = output_dir / "voiceover-normalized.wav" if normalize_audio else None
+    output_video_path = output_dir / "final-voiceover.mp4"
+    audio_render = {
+        "contentId": item_id,
+        "audioRenderId": item_audio_render_id,
+        "status": "processing",
+        "sourceVideoRenderId": video_render.get("videoRenderId"),
+        "sourceAudioPath": str(audio_path),
+        "normalizedAudioPath": str(normalized_audio_path) if normalized_audio_path else "",
+        "audioFile": {"filename": audio_path.name, "path": str(audio_path)},
+        "outputVideo": {"filename": "final-voiceover.mp4", "path": str(output_video_path), "mimeType": "video/mp4"},
+        "audioMode": audio_mode,
+        "normalizeAudio": normalize_audio,
+        "fitMode": fit_mode,
+        "videoDurationSeconds": video_duration,
+        "audioDurationSeconds": audio_duration,
+        "finalDurationSeconds": video_duration,
+        "statusMessage": "",
+        "errorMessage": "",
+        "createdAt": now_iso(),
+        "updatedAt": now_iso(),
+    }
+    if not isinstance(record.get("audioRenders"), list):
+        record["audioRenders"] = []
+    record["audioRenders"].append(audio_render)
+    record["latestAudioRender"] = audio_render
+    record["updatedAt"] = now_iso()
+    STORE.save(record)
+
+    try:
+        audio_to_mix = audio_path
+        if normalize_audio and normalized_audio_path:
+            normalize_voiceover_audio(audio_path, normalized_audio_path, video_duration)
+            audio_to_mix = normalized_audio_path
+        mix_voiceover_video(source_video, audio_to_mix, output_video_path, video_duration)
+        final_probe = probe_media(output_video_path)
+        if not probe_has_stream(final_probe, "video") or not probe_has_stream(final_probe, "audio"):
+            raise AppError(HTTPStatus.BAD_GATEWAY, "invalid_audio_output", "Generated MP4 is missing video or audio stream.")
+        audio_render["finalDurationSeconds"] = media_duration_seconds(final_probe, "final video")
+    except AppError as exc:
+        audio_render["status"] = "failed"
+        audio_render["errorMessage"] = exc.message
+        audio_render["updatedAt"] = now_iso()
+        record["latestAudioRender"] = audio_render
+        record["updatedAt"] = now_iso()
+        STORE.save(record)
+        raise
+
+    audio_render["status"] = "completed"
+    audio_render["updatedAt"] = now_iso()
+    write_audio_metadata(output_dir, audio_render)
+    record["latestAudioRender"] = audio_render
+    record["updatedAt"] = now_iso()
+    STORE.save(record)
+    LOGGER.info("audio_metadata_stored content_id=%s audio_render_id=%s", item_id, item_audio_render_id)
+    return normalize_audio_result(audio_render)
 
 
 def video_filter_for_slide(
@@ -1357,6 +1815,21 @@ class AnnotasiHandler(BaseHTTPRequestHandler):
             json_response(self, HTTPStatus.OK, normalize_video_result(video_render))
             return
 
+        audio_render_match = re.fullmatch(r"/api/v1/audio-render/(aud_\d{8}_[a-f0-9]{8})", path)
+        if audio_render_match:
+            audio_render = STORE.find_audio_render(audio_render_match.group(1))
+            json_response(self, HTTPStatus.OK, normalize_audio_result(audio_render))
+            return
+
+        latest_audio_match = re.fullmatch(r"/api/v1/content/(cnt_\d{8}_[a-f0-9]{8})/audio/latest", path)
+        if latest_audio_match:
+            record = STORE.get(latest_audio_match.group(1))
+            audio_render = record.get("latestAudioRender")
+            if not isinstance(audio_render, dict):
+                raise AppError(HTTPStatus.NOT_FOUND, "audio_render_not_found", "No audio render exists for this content.")
+            json_response(self, HTTPStatus.OK, normalize_audio_result(audio_render))
+            return
+
         latest_video_match = re.fullmatch(r"/api/v1/content/(cnt_\d{8}_[a-f0-9]{8})/render/video", path)
         if latest_video_match:
             record = STORE.get(latest_video_match.group(1))
@@ -1375,7 +1848,7 @@ class AnnotasiHandler(BaseHTTPRequestHandler):
             json_response(self, HTTPStatus.OK, normalize_render_result(render))
             return
 
-        match = re.fullmatch(r"/api/v1/content/(cnt_\d{8}_[a-f0-9]{8})(?:/(caption|voiceover))?", path)
+        match = re.fullmatch(r"/api/v1/content/(cnt_\d{8}_[a-f0-9]{8})(?:/(caption|voiceover|voiceover-script))?", path)
         if not match:
             raise AppError(HTTPStatus.NOT_FOUND, "not_found", "Route not found.")
 
@@ -1388,7 +1861,7 @@ class AnnotasiHandler(BaseHTTPRequestHandler):
                 "hashtags": record["content"]["hashtags"],
                 "telegramMessages": format_caption_for_telegram(record),
             }
-        elif view == "voiceover":
+        elif view in {"voiceover", "voiceover-script"}:
             body = {
                 "id": item_id,
                 "voiceoverScript": record["content"]["voiceoverScript"],
@@ -1401,6 +1874,14 @@ class AnnotasiHandler(BaseHTTPRequestHandler):
     def handle_post(self) -> None:
         path = self.path.split("?", 1)[0].rstrip("/")
         body = read_json_body(self)
+        audio_prepare_match = re.fullmatch(r"/api/v1/content/(cnt_\d{8}_[a-f0-9]{8})/audio/prepare", path)
+        if audio_prepare_match:
+            json_response(self, HTTPStatus.OK, prepare_audio_session(audio_prepare_match.group(1)))
+            return
+        audio_mix_match = re.fullmatch(r"/api/v1/content/(cnt_\d{8}_[a-f0-9]{8})/audio/mix", path)
+        if audio_mix_match:
+            json_response(self, HTTPStatus.OK, render_content_audio_mix(audio_mix_match.group(1), body))
+            return
         video_render_match = re.fullmatch(r"/api/v1/content/(cnt_\d{8}_[a-f0-9]{8})/render/video", path)
         if video_render_match:
             json_response(self, HTTPStatus.OK, render_content_video(video_render_match.group(1), body))

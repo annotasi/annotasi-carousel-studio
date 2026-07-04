@@ -15,6 +15,7 @@ This is intentionally a small HTTP service instead of a Hermes patch because the
 - Renders existing carousel content into 1080x1350 PNG slides with the `annotasi_hikmah_dark` template.
 - Stores render metadata beside the existing content JSON record.
 - Converts completed PNG carousel renders into 1080x1920 vertical MP4 videos for Shorts/Reels/TikTok.
+- Mixes a user-provided voiceover audio file into the latest completed MP4 video.
 
 ## Files
 
@@ -41,6 +42,7 @@ ANNOTASI_HOST=127.0.0.1
 ANNOTASI_PORT=8097
 CONTENT_STORAGE_DIR=./data/content
 CONTENT_EXPORT_DIR=./data/exports
+CONTENT_AUDIO_DIR=./data/audio
 AI_TIMEOUT_SECONDS=90
 TELEGRAM_MESSAGE_LIMIT=3900
 LOG_LEVEL=INFO
@@ -58,6 +60,12 @@ VIDEO_DEFAULT_MOTION_PRESET=calm_zoom
 VIDEO_RENDER_TIMEOUT_SECONDS=180
 FFMPEG_PATH=ffmpeg
 FFPROBE_PATH=ffprobe
+AUDIO_MAX_FILE_SIZE_MB=50
+AUDIO_ALLOWED_EXTENSIONS=mp3,m4a,wav,ogg,oga
+AUDIO_NORMALIZE_ENABLED=true
+AUDIO_DEFAULT_FIT_MODE=trim_or_pad
+AUDIO_RENDER_TIMEOUT_SECONDS=180
+AUDIO_OUTPUT_CODEC=aac
 ```
 
 The service logs whether an API key is configured, but never logs the key value.
@@ -103,6 +111,18 @@ ffmpeg -version
 
 The service calls FFmpeg with argument arrays, validates input PNG paths, captures FFmpeg stderr for readable failures, and writes MP4 output under `CONTENT_EXPORT_DIR`.
 
+## Voiceover Setup
+
+Voiceover mixing uses FFmpeg and FFprobe. Put audio files under `CONTENT_AUDIO_DIR`; absolute paths outside that directory are rejected.
+
+Supported extensions by default:
+
+```text
+mp3, m4a, wav, ogg, oga
+```
+
+The service validates file existence, extension, size, audio stream presence, and duration before mixing. It does not generate voices, clone voices, or imitate any real person.
+
 ## API
 
 ### Generate Carousel
@@ -143,6 +163,12 @@ curl -s http://127.0.0.1:8097/api/v1/content/cnt_20260704_ab12cd34/caption
 
 ```sh
 curl -s http://127.0.0.1:8097/api/v1/content/cnt_20260704_ab12cd34/voiceover
+```
+
+Alias for Telegram-style command naming:
+
+```sh
+curl -s http://127.0.0.1:8097/api/v1/content/cnt_20260704_ab12cd34/voiceover-script
 ```
 
 ### Generate Ideas
@@ -207,6 +233,40 @@ curl -s http://127.0.0.1:8097/api/v1/content/cnt_20260704_ab12cd34/render/video
 curl -s http://127.0.0.1:8097/api/v1/video-render/vid_20260704_ab12cd34
 ```
 
+### Prepare Voiceover Mixing
+
+```sh
+curl -s -X POST http://127.0.0.1:8097/api/v1/content/cnt_20260704_ab12cd34/audio/prepare
+```
+
+### Mix Voiceover Audio
+
+The audio path must be inside `CONTENT_AUDIO_DIR`.
+
+```sh
+curl -s http://127.0.0.1:8097/api/v1/content/cnt_20260704_ab12cd34/audio/mix \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "audioFilePath": "./data/audio/cnt_20260704_ab12cd34/voiceover.m4a",
+    "audioMode": "voiceover",
+    "normalizeAudio": true,
+    "fitMode": "trim_or_pad",
+    "forceRegenerate": false
+  }'
+```
+
+### Get Latest Audio Render
+
+```sh
+curl -s http://127.0.0.1:8097/api/v1/content/cnt_20260704_ab12cd34/audio/latest
+```
+
+### Get Audio Render Metadata
+
+```sh
+curl -s http://127.0.0.1:8097/api/v1/audio-render/aud_20260704_ab12cd34
+```
+
 ## Hermes Integration
 
 Recommended Telegram command mapping:
@@ -217,6 +277,7 @@ Recommended Telegram command mapping:
 | `/hikmah <topic>` | `POST /api/v1/content/hikmah` with `{ "topic": "<topic>" }` |
 | `/caption <content_id>` | `GET /api/v1/content/{content_id}/caption` |
 | `/voiceover <content_id>` | `GET /api/v1/content/{content_id}/voiceover` |
+| `/voiceover_script <content_id>` | `GET /api/v1/content/{content_id}/voiceover-script` |
 | `/content <content_id>` | `GET /api/v1/content/{content_id}` |
 | `/ideas <niche>` | `POST /api/v1/content/ideas` with `{ "niche": "<niche>" }` |
 | `/render <content_id>` | `POST /api/v1/content/{content_id}/render/png` |
@@ -225,6 +286,10 @@ Recommended Telegram command mapping:
 | `/video <content_id>` | `POST /api/v1/content/{content_id}/render/video` |
 | `/video_list <content_id>` | `GET /api/v1/content/{content_id}/render/video` |
 | `/video_status <video_render_id>` | `GET /api/v1/video-render/{video_render_id}` |
+| `/mixvoice <content_id>` | `POST /api/v1/content/{content_id}/audio/prepare` |
+| `/mixvoice_file <content_id> <audio_file_path>` | `POST /api/v1/content/{content_id}/audio/mix` |
+| `/audio_list <content_id>` | `GET /api/v1/content/{content_id}/audio/latest` |
+| `/audio_status <audio_render_id>` | `GET /api/v1/audio-render/{audio_render_id}` |
 | `/help` | Show the command list above |
 
 Hermes should send every string in the response `telegramMessages` array as a separate Telegram message, in order. For `/render`, if Hermes supports sending local files or private download links, it can also send each `files[].path` PNG after the text response. For `/video`, Hermes can send `file.path` as a video if the bot adapter and Telegram file size limits allow it; otherwise return the path or private download link.
@@ -307,6 +372,34 @@ for (const message of payload.telegramMessages) {
 // Optional: send payload.file.path when Telegram file upload is supported.
 ```
 
+Voiceover pseudo-code:
+
+```js
+const response = await fetch(`${ANNOTASI_CONTENT_URL}/api/v1/content/${contentId}/audio/mix`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({
+    audioFilePath,
+    audioMode: "voiceover",
+    normalizeAudio: true,
+    fitMode: "trim_or_pad",
+    forceRegenerate: false
+  })
+});
+
+const payload = await response.json();
+if (!response.ok) {
+  await telegram.sendMessage(chatId, payload.error?.message || "Gagal mix voiceover.");
+  return;
+}
+
+for (const message of payload.telegramMessages) {
+  await telegram.sendMessage(chatId, message);
+}
+
+// Optional: send payload.outputVideo.path when Telegram video upload is supported.
+```
+
 ## Example Telegram Output
 
 ```text
@@ -329,6 +422,30 @@ Use /voiceover cnt_20260704_ab12cd34
 
 Content ID:
 cnt_20260704_ab12cd34
+
+Reminder:
+Review kembali sebelum upload agar tidak salah konteks.
+```
+
+## Example Voiceover Output
+
+```text
+Final Video dengan Voiceover
+
+Content ID:
+cnt_20260704_ab12cd34
+
+Audio Render ID:
+aud_20260704_ef56ab78
+
+Source Video Render ID:
+vid_20260704_1122aabb
+
+Duration:
+35.0 seconds
+
+Output:
+/absolute/path/data/exports/cnt_20260704_ab12cd34/aud_20260704_ef56ab78/final-voiceover.mp4
 
 Reminder:
 Review kembali sebelum upload agar tidak salah konteks.
@@ -396,6 +513,10 @@ Default local structure:
 ./data/exports/{content_id}/{render_id}/slide-03.png
 ./data/exports/{content_id}/{video_render_id}/final.mp4
 ./data/exports/{content_id}/{video_render_id}/render-metadata.json
+./data/audio/{content_id}/voiceover-original.m4a
+./data/exports/{content_id}/{audio_render_id}/voiceover-normalized.wav
+./data/exports/{content_id}/{audio_render_id}/final-voiceover.mp4
+./data/exports/{content_id}/{audio_render_id}/audio-render-metadata.json
 ```
 
 The base directory is configured with `CONTENT_EXPORT_DIR`.
@@ -428,7 +549,24 @@ Current video renderer:
 - supported motion presets: `calm_zoom`, `static`
 - no AI calls
 - no voice cloning
-- no audio mixing in this milestone
+- voiceover audio mixing is handled by the Milestone 4 flow below
+
+## Voiceover Mixing
+
+Current audio mixer:
+
+- voiceover audio only
+- user-provided local file only
+- audio must be inside `CONTENT_AUDIO_DIR`
+- optional loudness normalization with FFmpeg `loudnorm`
+- AAC output audio
+- video stream copied from the source MP4
+- source video duration is preserved
+- if audio is longer, it is trimmed to video duration
+- if audio is shorter, it ends naturally; the video continues
+- no background music
+- no AI voice generation
+- no voice cloning or imitation
 
 ## Error Handling
 
@@ -454,6 +592,15 @@ The service handles:
 - FFmpeg segment or concat failure.
 - Generated MP4 missing or zero-byte.
 - Duplicate video render requests return existing completed files unless `forceRegenerate` is `true`.
+- Audio file missing.
+- Audio path outside `CONTENT_AUDIO_DIR`.
+- Unsupported audio format.
+- Audio file too large.
+- Invalid audio stream.
+- FFprobe unavailable or duration detection failure.
+- Voiceover mixing failure.
+- Generated voiceover MP4 missing or zero-byte.
+- Duplicate audio mix requests return existing completed files unless `forceRegenerate` is `true`.
 
 ## Known Limitations
 
@@ -462,7 +609,9 @@ The service handles:
 - PNG rendering requires local Playwright dependencies and Chromium.
 - Telegram file upload is not included here because the Hermes adapter was not available.
 - MP4 rendering requires FFmpeg on the host.
-- Video voiceover and background music are intentionally reserved for a future milestone.
+- Voiceover mixing requires FFmpeg and FFprobe on the host.
+- Telegram voice note download/session handling is not implemented in this service because Hermes code is not available; use `/mixvoice_file` or wire Hermes uploads to `/audio/mix`.
+- Background music is intentionally reserved for a future milestone.
 - Telegram video upload is not included here because the Hermes adapter was not available.
 
 ## Manual Test Guide
@@ -542,12 +691,63 @@ Do not run this against production services until the service is configured safe
 /voiceover <content_id>
 ```
 
+## Manual Voiceover Test Guide
+
+1. Generate content:
+
+```text
+/hikmah kerja keras dan rezeki halal
+```
+
+2. Retrieve voiceover script:
+
+```text
+/voiceover <content_id>
+```
+
+or:
+
+```text
+/voiceover_script <content_id>
+```
+
+3. Record your own voice reading the script.
+
+4. Put the audio file under:
+
+```text
+./data/audio/{content_id}/voiceover.m4a
+```
+
+5. Render PNG and MP4:
+
+```text
+/render <content_id>
+/video <content_id>
+```
+
+6. Mix voiceover:
+
+```text
+/mixvoice_file <content_id> ./data/audio/{content_id}/voiceover.m4a
+```
+
+7. Verify:
+
+- `final-voiceover.mp4` is generated.
+- video is playable.
+- resolution remains 1080x1920.
+- voiceover is audible.
+- video duration remains close to the source video duration.
+- no voice cloning or impersonation was used.
+- existing commands still work.
+
 ## Suggested Next Milestone
 
-Add voiceover recording upload, audio mixing, optional background music, subtitle overlay, and a lightweight review/edit dashboard.
+Add content review/edit workflow, dashboard, content calendar, source/transcript manager, optional subtitle overlay, and user-provided background music support.
 
 ## Suggested Commit Message
 
 ```text
-feat(content): add MP4 motion video renderer
+feat(content): add voiceover audio mixing
 ```
