@@ -18,6 +18,7 @@ This is intentionally a small HTTP service instead of a Hermes patch because the
 - Mixes a user-provided voiceover audio file into the latest completed MP4 video.
 - Adds review/edit workflow status, render staleness, upload markers, and a simple content calendar.
 - Tracks source materials, transcripts, transcript segments, permissions, credits, and source-content links.
+- Finds transcript highlights and stores clip/content candidates that can be reviewed before content generation.
 
 ## Files
 
@@ -80,6 +81,13 @@ TRANSCRIPT_SEGMENT_MIN_WORDS=300
 TRANSCRIPT_SEGMENT_MAX_WORDS=800
 SOURCE_DEFAULT_LANGUAGE=id
 SOURCE_DEFAULT_PERMISSION_STATUS=unknown
+CANDIDATE_BLOCK_RESTRICTED_SOURCE=true
+CANDIDATE_ALLOW_UNKNOWN_PERMISSION=true
+CANDIDATE_ALLOW_HIGH_RISK=false
+CANDIDATE_DEFAULT_COUNT=10
+CANDIDATE_MAX_TRANSCRIPT_CHARS=30000
+CANDIDATE_MAX_SEGMENTS_PER_RUN=20
+CANDIDATE_ALLOWED_TYPES=carousel,short_video,voiceover_reflection,quote_post,mixed
 ```
 
 The service logs whether an API key is configured, but never logs the key value.
@@ -447,6 +455,47 @@ curl -s -X POST http://127.0.0.1:8097/api/v1/segments/seg_20260704_ab12cd34/gene
 curl -s http://127.0.0.1:8097/api/v1/content/cnt_20260704_ab12cd34/source
 ```
 
+### Highlight Candidates
+
+Generate transcript candidates from a source:
+
+```sh
+curl -s http://127.0.0.1:8097/api/v1/sources/src_20260704_ab12cd34/highlights \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "candidateCount": 10,
+    "preferredTypes": ["carousel", "short_video", "voiceover_reflection", "quote_post"],
+    "allowHighRisk": false
+  }'
+```
+
+Generate candidates from one segment:
+
+```sh
+curl -s http://127.0.0.1:8097/api/v1/segments/seg_20260704_ab12cd34/highlights \
+  -H 'Content-Type: application/json' \
+  -d '{"candidateCount":5}'
+```
+
+List and inspect candidates:
+
+```sh
+curl -s http://127.0.0.1:8097/api/v1/sources/src_20260704_ab12cd34/candidates
+curl -s http://127.0.0.1:8097/api/v1/candidates/cand_20260704_ab12cd34
+curl -s 'http://127.0.0.1:8097/api/v1/candidate-list?status=suggested'
+```
+
+Approve, reject, or generate content:
+
+```sh
+curl -s -X POST http://127.0.0.1:8097/api/v1/candidates/cand_20260704_ab12cd34/approve
+curl -s http://127.0.0.1:8097/api/v1/candidates/cand_20260704_ab12cd34/reject \
+  -H 'Content-Type: application/json' \
+  -d '{"reason":"terlalu berisiko salah konteks"}'
+curl -s -X POST http://127.0.0.1:8097/api/v1/candidates/cand_20260704_ab12cd34/generate-content
+curl -s http://127.0.0.1:8097/api/v1/content/cnt_20260704_ab12cd34/candidate
+```
+
 ## Hermes Integration
 
 Recommended Telegram command mapping:
@@ -504,6 +553,17 @@ Recommended Telegram command mapping:
 | `/from_source <source_id> <topic_optional>` | `POST /api/v1/sources/{source_id}/generate-content` |
 | `/from_segment <segment_id>` | `POST /api/v1/segments/{segment_id}/generate-content` |
 | `/source_for_content <content_id>` | `GET /api/v1/content/{content_id}/source` |
+| `/highlights_from_source <source_id>` | `POST /api/v1/sources/{source_id}/highlights` |
+| `/highlights_from_segment <segment_id>` | `POST /api/v1/segments/{segment_id}/highlights` |
+| `/candidates <source_id>` | `GET /api/v1/sources/{source_id}/candidates` |
+| `/candidate <candidate_id>` | `GET /api/v1/candidates/{candidate_id}` |
+| `/candidate_approve <candidate_id>` | `POST /api/v1/candidates/{candidate_id}/approve` |
+| `/candidate_reject <candidate_id> <reason>` | `POST /api/v1/candidates/{candidate_id}/reject` |
+| `/candidate_status <candidate_id>` | `GET /api/v1/candidates/{candidate_id}` |
+| `/generate_from_candidate <candidate_id>` | `POST /api/v1/candidates/{candidate_id}/generate-content` |
+| `/candidate_for_content <content_id>` | `GET /api/v1/content/{content_id}/candidate` |
+| `/candidate_list <status_optional>` | `GET /api/v1/candidate-list?status=<status>` |
+| `/highlights_help` | Show highlight/candidate help text in Hermes |
 | `/help` | Show the command list above |
 
 Hermes should send every string in the response `telegramMessages` array as a separate Telegram message, in order. For `/render`, if Hermes supports sending local files or private download links, it can also send each `files[].path` PNG after the text response. For `/video`, Hermes can send `file.path` as a video if the bot adapter and Telegram file size limits allow it; otherwise return the path or private download link.
@@ -860,6 +920,40 @@ Segmentation rules:
 - untimestamped segments receive context note: `Timestamp tidak tersedia. Segment dibuat berdasarkan struktur teks.`
 - risk level is a heuristic default and should be manually reviewed.
 
+## Candidate Data
+
+Clip candidates are stored as planning records inside the source JSON under `candidates`; this service does not create actual video clips. Content generated from a candidate receives `candidateLink`, and the candidate receives a `contentLinks` entry.
+
+Candidate fields:
+
+- `candidateId`
+- `sourceId`
+- `transcriptId`
+- `segmentId`
+- `candidateType`
+- `title`
+- `hook`
+- `angle`
+- `summary`
+- `suggestedFormat`
+- `suggestedDurationSeconds`
+- `riskLevel`
+- `needsContext`
+- `contextWarning`
+- `sourceCreditSuggestion`
+- `candidateStatus`
+- `aiReasoningSummary`
+- `contentLinks`
+- `createdAt`
+- `updatedAt`
+
+Candidate risk handling:
+
+- restricted or rejected sources are blocked by default through `CANDIDATE_BLOCK_RESTRICTED_SOURCE=true`.
+- unknown permission sources are allowed by default for MVP analysis through `CANDIDATE_ALLOW_UNKNOWN_PERMISSION=true`, but responses include warnings.
+- high-risk candidates are filtered or blocked unless `CANDIDATE_ALLOW_HIGH_RISK=true` or the request explicitly allows high risk.
+- `aiReasoningSummary` must be a short, user-safe rationale only; hidden chain-of-thought is not requested or stored.
+
 ## Template
 
 Current template:
@@ -957,6 +1051,15 @@ The service handles:
 - Restricted source generation blocked.
 - Source-based generation without transcript.
 - AI source ideas/content JSON validation failure.
+- Candidate not found.
+- Candidate must be approved before content generation.
+- Candidate already converted to content.
+- Duplicate candidate title detected.
+- Restricted or rejected source blocked for highlight generation.
+- Source permission unknown when unknown permission analysis is disabled.
+- High-risk candidate blocked by configuration.
+- AI returned no candidates.
+- Long transcript analysis is truncated to `CANDIDATE_MAX_TRANSCRIPT_CHARS`.
 
 ## Known Limitations
 
@@ -975,6 +1078,10 @@ The service handles:
 - Transcript paste sessions are not implemented in this service; use direct `/transcript_add` or wire Hermes state to the transcript endpoint.
 - Source segmentation is heuristic and should be reviewed manually.
 - Source-based idea/content generation uses transcript excerpts, not full long-document retrieval.
+- Highlight candidates are planning records only; this milestone does not create actual video clips.
+- YouTube/Instagram/TikTok download is not implemented.
+- Long transcript analysis is capped by `CANDIDATE_MAX_TRANSCRIPT_CHARS` and `CANDIDATE_MAX_SEGMENTS_PER_RUN`.
+- AI risk level is a suggestion only; manual source/context review remains required before publishing.
 
 ## Manual Test Guide
 
@@ -1232,12 +1339,56 @@ Expected: status should require review again, and media render flags should be s
 
 Expected: source, credit, permission, segment, and risk context appear in the review output.
 
+## Manual Candidate Test Guide
+
+1. Generate highlights from a source:
+
+```text
+/highlights_from_source <source_id>
+```
+
+2. Generate highlights from one transcript segment:
+
+```text
+/highlights_from_segment <segment_id>
+```
+
+3. List and inspect candidates:
+
+```text
+/candidates <source_id>
+/candidate <candidate_id>
+/candidate_list suggested
+```
+
+4. Approve or reject a candidate:
+
+```text
+/candidate_approve <candidate_id>
+/candidate_reject <candidate_id> terlalu berisiko salah konteks
+```
+
+5. Generate review-ready content from an approved candidate:
+
+```text
+/generate_from_candidate <candidate_id>
+```
+
+6. Check the candidate link from generated content:
+
+```text
+/candidate_for_content <content_id>
+/review <content_id>
+```
+
+Expected: candidate ID, source, risk, context warning, source credit, and candidate checklist appear in review output. The generated content remains `needs_review`.
+
 ## Suggested Next Milestone
 
-Add AI highlight finder, clip candidate generation, timestamp-based clip planning, manual clip selection, local source video clipping, subtitle overlay, and clip package export.
+Milestone 8: add content package export with posting checklist, grouped final media, JSON metadata, captions, source/candidate review notes, and optional ZIP output.
 
 ## Suggested Commit Message
 
 ```text
-feat(content): add source and transcript management
+feat(content): add transcript highlight candidates
 ```

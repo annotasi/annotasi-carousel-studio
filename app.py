@@ -74,6 +74,17 @@ TRANSCRIPT_SEGMENT_MIN_WORDS = int(os.getenv("TRANSCRIPT_SEGMENT_MIN_WORDS", "30
 TRANSCRIPT_SEGMENT_MAX_WORDS = int(os.getenv("TRANSCRIPT_SEGMENT_MAX_WORDS", "800"))
 SOURCE_DEFAULT_LANGUAGE = os.getenv("SOURCE_DEFAULT_LANGUAGE", "id")
 SOURCE_DEFAULT_PERMISSION_STATUS = os.getenv("SOURCE_DEFAULT_PERMISSION_STATUS", "unknown")
+CANDIDATE_BLOCK_RESTRICTED_SOURCE = os.getenv("CANDIDATE_BLOCK_RESTRICTED_SOURCE", "true").lower() in {"1", "true", "yes", "on"}
+CANDIDATE_ALLOW_UNKNOWN_PERMISSION = os.getenv("CANDIDATE_ALLOW_UNKNOWN_PERMISSION", "true").lower() in {"1", "true", "yes", "on"}
+CANDIDATE_ALLOW_HIGH_RISK = os.getenv("CANDIDATE_ALLOW_HIGH_RISK", "false").lower() in {"1", "true", "yes", "on"}
+CANDIDATE_DEFAULT_COUNT = int(os.getenv("CANDIDATE_DEFAULT_COUNT", "10"))
+CANDIDATE_MAX_TRANSCRIPT_CHARS = int(os.getenv("CANDIDATE_MAX_TRANSCRIPT_CHARS", "30000"))
+CANDIDATE_MAX_SEGMENTS_PER_RUN = int(os.getenv("CANDIDATE_MAX_SEGMENTS_PER_RUN", "20"))
+CANDIDATE_ALLOWED_TYPES = {
+    part.strip().lower()
+    for part in os.getenv("CANDIDATE_ALLOWED_TYPES", "carousel,short_video,voiceover_reflection,quote_post,mixed").split(",")
+    if part.strip()
+}
 TELEGRAM_LIMIT = int(os.getenv("TELEGRAM_MESSAGE_LIMIT", "3900"))
 SERVICE_DIR = Path(__file__).resolve().parent
 NODE_RENDERER = SERVICE_DIR / "render_png.js"
@@ -119,6 +130,8 @@ SUPPORTED_PERMISSION_STATUSES = {
 SUPPORTED_SOURCE_STATUSES = {"draft", "needs_review", "approved", "restricted", "archived"}
 SUPPORTED_TRANSCRIPT_STATUSES = {"available", "draft", "archived"}
 SUPPORTED_RISK_LEVELS = {"low", "medium", "high"}
+SUPPORTED_CANDIDATE_TYPES = {"carousel", "short_video", "voiceover_reflection", "quote_post", "mixed"}
+SUPPORTED_CANDIDATE_STATUSES = {"suggested", "needs_review", "approved", "rejected", "converted_to_content", "archived"}
 
 LOGGER = logging.getLogger("annotasi_carousel_studio")
 
@@ -198,6 +211,11 @@ def segment_id() -> str:
     return f"seg_{stamp}_{secrets.token_hex(4)}"
 
 
+def candidate_id() -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+    return f"cand_{stamp}_{secrets.token_hex(4)}"
+
+
 def word_count(text: str) -> int:
     return len(re.findall(r"\S+", text.strip()))
 
@@ -230,6 +248,18 @@ def parse_float(
         return float(value)
     except (TypeError, ValueError) as exc:
         raise AppError(status, code, f"{field_name} must be a number.") from exc
+
+
+def parse_bool(value: Any, default: bool = False) -> bool:
+    if value in (None, ""):
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return default
 
 
 def strip_json_fence(text: str) -> str:
@@ -675,6 +705,163 @@ Return JSON only using this schema:
 }}"""
 
 
+def highlight_candidates_prompt(
+    source: dict[str, Any],
+    transcript: dict[str, Any],
+    context_text: str,
+    *,
+    candidate_count: int,
+    preferred_types: list[str],
+    segment: Optional[dict[str, Any]] = None,
+) -> str:
+    segment_context = ""
+    if segment:
+        segment_context = f"""
+Focus segment:
+- segmentId: {segment.get("segmentId")}
+- riskLevel: {segment.get("riskLevel")}
+- contextNotes: {segment.get("contextNotes")}
+- text: {segment.get("text")}
+"""
+    return f"""Analyze this source transcript and suggest safe content candidates.
+
+Source:
+- sourceId: {source.get("sourceId")}
+- title: {source.get("title")}
+- speakerName: {source.get("speakerName")}
+- sourceUrl: {source.get("sourceUrl")}
+- platform: {source.get("platform")}
+- permissionStatus: {source.get("permissionStatus")}
+- creditText: {source.get("creditText")}
+
+Transcript:
+- transcriptId: {transcript.get("transcriptId")}
+{segment_context}
+
+Context text:
+{context_text[:CANDIDATE_MAX_TRANSCRIPT_CHARS]}
+
+Candidate count: {candidate_count}
+Preferred types: {", ".join(preferred_types)}
+
+Safety rules:
+- Bahasa Indonesia.
+- Do not invent Quran verses.
+- Do not invent hadith.
+- Do not create fatwa-style conclusions.
+- Do not attribute anything to a speaker unless it exists in source metadata/transcript.
+- Do not exaggerate or clickbait.
+- Do not cut meaning out of context.
+- For medium/high risk candidates, include contextWarning.
+- aiReasoningSummary must be short and user-safe; do not include hidden chain-of-thought.
+- Prefer hikmah, renungan, catatan, or pengingat framing.
+
+Return JSON only:
+{{
+  "sourceId": "string",
+  "transcriptId": "string",
+  "analysisSummary": "string",
+  "candidates": [
+    {{
+      "candidateType": "carousel|short_video|voiceover_reflection|quote_post|mixed",
+      "segmentId": "string|null",
+      "title": "string",
+      "hook": "string",
+      "angle": "string",
+      "summary": "string",
+      "suggestedFormat": "string",
+      "suggestedDurationSeconds": 45,
+      "riskLevel": "low|medium|high",
+      "needsContext": true,
+      "contextWarning": "string",
+      "sourceCreditSuggestion": "string",
+      "aiReasoningSummary": "string"
+    }}
+  ],
+  "safetyNotes": ["string"]
+}}"""
+
+
+def candidate_content_prompt(source: dict[str, Any], transcript: dict[str, Any], candidate: dict[str, Any], segment: Optional[dict[str, Any]]) -> str:
+    segment_text = str(segment.get("text") or "") if segment else ""
+    transcript_excerpt = str(transcript.get("transcriptText") or "")[:5000]
+    return f"""Generate one Annotasi Hikmah carousel package from this approved content candidate.
+
+Candidate:
+- candidateId: {candidate.get("candidateId")}
+- type: {candidate.get("candidateType")}
+- title: {candidate.get("title")}
+- hook: {candidate.get("hook")}
+- angle: {candidate.get("angle")}
+- summary: {candidate.get("summary")}
+- riskLevel: {candidate.get("riskLevel")}
+- needsContext: {candidate.get("needsContext")}
+- contextWarning: {candidate.get("contextWarning")}
+
+Source:
+- sourceId: {source.get("sourceId")}
+- sourceTitle: {source.get("title")}
+- speakerName: {source.get("speakerName")}
+- sourceUrl: {source.get("sourceUrl")}
+- creditText: {source.get("creditText")}
+- permissionStatus: {source.get("permissionStatus")}
+- segmentId: {candidate.get("segmentId") or ""}
+
+Segment/context:
+{segment_text or transcript_excerpt}
+
+Rules:
+- Bahasa Indonesia.
+- Do not invent Quran verses.
+- Do not invent hadith.
+- Do not make fatwa-style conclusions.
+- Do not add claims beyond the source context.
+- Keep calm, reflective, respectful, not clickbait.
+- Include source credit suggestion.
+- Content status will be needs_review; do not auto-approve.
+
+Return JSON only using this schema:
+{{
+  "title": "string",
+  "niche": "string",
+  "tone": "string",
+  "source": {{
+    "sourceId": "string",
+    "sourceTitle": "string",
+    "speakerName": "string",
+    "sourceUrl": "string",
+    "creditText": "string",
+    "permissionStatus": "string",
+    "segmentId": "string|null",
+    "candidateId": "string",
+    "riskLevel": "low|medium|high"
+  }},
+  "slides": [
+    {{
+      "slideNumber": 1,
+      "type": "hook|body|closing",
+      "text": "string",
+      "visualDirection": "string"
+    }}
+  ],
+  "caption": "string",
+  "hashtags": ["string"],
+  "voiceoverScript": "string",
+  "videoStoryboard": [
+    {{
+      "sceneNumber": 1,
+      "durationSeconds": 5,
+      "visual": "string",
+      "motion": "string",
+      "voiceoverPart": "string"
+    }}
+  ],
+  "safetyNotes": ["string"],
+  "sourceCreditSuggestion": "string",
+  "callToAction": "string"
+}}"""
+
+
 def call_ai_json(messages: list[dict[str, str]]) -> dict[str, Any]:
     if not AI_API_KEY:
         raise AppError(
@@ -1088,6 +1275,13 @@ def format_review_for_telegram(record: dict[str, Any]) -> list[str]:
     if isinstance(link, dict) and link.get("sourceId"):
         try:
             linked_source = SOURCE_STORE.get(str(link["sourceId"]))
+            candidate_link = record.get("candidateLink")
+            linked_candidate = None
+            if isinstance(candidate_link, dict) and candidate_link.get("candidateId"):
+                try:
+                    _source, linked_candidate = find_candidate(str(candidate_link["candidateId"]))
+                except AppError:
+                    linked_candidate = None
             lines.extend(
                 [
                     "Source:",
@@ -1108,6 +1302,38 @@ def format_review_for_telegram(record: dict[str, Any]) -> list[str]:
                     "Risk:",
                     str(link.get("riskLevel") or "medium"),
                     "",
+                ]
+            )
+            if linked_candidate:
+                lines.extend(
+                    [
+                        "Candidate:",
+                        str(linked_candidate.get("candidateId")),
+                        "",
+                        "Candidate type:",
+                        str(linked_candidate.get("candidateType")),
+                        "",
+                        "Candidate risk:",
+                        str(linked_candidate.get("riskLevel")),
+                        "",
+                        "Needs context:",
+                        "yes" if linked_candidate.get("needsContext") else "no",
+                        "",
+                        "Context warning:",
+                        str(linked_candidate.get("contextWarning") or "-"),
+                        "",
+                        "Candidate checklist:",
+                        "[ ] Candidate context reviewed",
+                        "[ ] Candidate risk level checked",
+                        "[ ] Source credit included",
+                        "[ ] Segment meaning not changed",
+                        "[ ] Hook is not clickbait",
+                        "[ ] Generated content matches candidate angle",
+                        "",
+                    ]
+                )
+            lines.extend(
+                [
                     "Source checklist:",
                     "[ ] Source is linked",
                     "[ ] Credit text is included",
@@ -2611,10 +2837,40 @@ def validate_risk_level(value: str) -> str:
     return normalized
 
 
+def validate_candidate_type(value: str) -> str:
+    normalized = (value or "mixed").strip().lower()
+    if normalized not in SUPPORTED_CANDIDATE_TYPES:
+        raise AppError(HTTPStatus.BAD_REQUEST, "invalid_candidate_type", "Candidate type is invalid.")
+    return normalized
+
+
+def validate_candidate_status(value: str) -> str:
+    normalized = (value or "suggested").strip().lower()
+    if normalized not in SUPPORTED_CANDIDATE_STATUSES:
+        raise AppError(HTTPStatus.BAD_REQUEST, "invalid_candidate_status", "Candidate status is invalid.")
+    return normalized
+
+
+def source_candidates(source: dict[str, Any]) -> list[dict[str, Any]]:
+    candidates = source.get("candidates")
+    return candidates if isinstance(candidates, list) else []
+
+
+def candidate_counts(source: dict[str, Any]) -> dict[str, int]:
+    counts = {"total": 0, "approved": 0, "converted_to_content": 0, "rejected": 0}
+    for candidate in source_candidates(source):
+        counts["total"] += 1
+        status = str(candidate.get("candidateStatus") or "")
+        if status in counts:
+            counts[status] += 1
+    return counts
+
+
 def source_summary(source: dict[str, Any]) -> dict[str, Any]:
     transcript = source.get("transcript") if isinstance(source.get("transcript"), dict) else {}
     segments = transcript.get("segments") if isinstance(transcript, dict) else []
     links = source.get("generatedContent") if isinstance(source.get("generatedContent"), list) else []
+    counts = candidate_counts(source)
     return {
         "sourceId": source.get("sourceId"),
         "title": source.get("title", ""),
@@ -2629,6 +2885,10 @@ def source_summary(source: dict[str, Any]) -> dict[str, Any]:
         "transcriptAvailable": bool(transcript.get("transcriptText")),
         "segmentCount": len(segments) if isinstance(segments, list) else 0,
         "generatedContentCount": len(links),
+        "candidateCount": counts["total"],
+        "approvedCandidateCount": counts["approved"],
+        "convertedCandidateCount": counts["converted_to_content"],
+        "rejectedCandidateCount": counts["rejected"],
         "contextNotes": source.get("contextNotes", ""),
     }
 
@@ -2684,6 +2944,9 @@ def format_source_detail_for_telegram(source: dict[str, Any]) -> list[str]:
             "",
             "Generated content:",
             f"{summary['generatedContentCount']} items",
+            "",
+            "Candidates:",
+            f"{summary['candidateCount']} total, {summary['approvedCandidateCount']} approved, {summary['convertedCandidateCount']} converted, {summary['rejectedCandidateCount']} rejected",
             "",
             "Notes:",
             str(summary["contextNotes"] or "-"),
@@ -2792,6 +3055,7 @@ def format_segments_for_telegram(source: dict[str, Any]) -> list[str]:
 
 
 def format_segment_detail_for_telegram(source: dict[str, Any], segment: dict[str, Any]) -> list[str]:
+    linked_count = sum(1 for candidate in source_candidates(source) if candidate.get("segmentId") == segment.get("segmentId"))
     text = "\n".join(
         [
             "Segment Detail",
@@ -2813,9 +3077,77 @@ def format_segment_detail_for_telegram(source: dict[str, Any], segment: dict[str
             "",
             "Context notes:",
             str(segment.get("contextNotes") or "-"),
+            "",
+            "Linked candidates:",
+            str(linked_count),
         ]
     )
     return split_telegram_message(text)
+
+
+def format_candidates_for_telegram(source: dict[str, Any], candidates: list[dict[str, Any]]) -> list[str]:
+    if not candidates:
+        return [f"Candidate List\n\nSource:\n{source.get('sourceId')}\n\nNo candidates found."]
+    lines = ["Candidate List", "", "Source:", str(source.get("sourceId")), ""]
+    for index, candidate in enumerate(candidates, start=1):
+        lines.extend(
+            [
+                f"{index}. {candidate.get('candidateId')} - {candidate.get('title')}",
+                f"Type: {candidate.get('candidateType')}",
+                f"Risk: {candidate.get('riskLevel')}",
+                f"Status: {candidate.get('candidateStatus')}",
+                "",
+            ]
+        )
+    return split_telegram_message("\n".join(lines).strip())
+
+
+def format_candidate_detail_for_telegram(source: dict[str, Any], candidate: dict[str, Any]) -> list[str]:
+    lines = [
+        "Candidate Detail",
+        "",
+        "Candidate ID:",
+        str(candidate.get("candidateId")),
+        "",
+        "Source:",
+        f"{source.get('sourceId')} - {source.get('title')}",
+        "",
+        "Segment:",
+        str(candidate.get("segmentId") or "none"),
+        "",
+        "Type:",
+        str(candidate.get("candidateType")),
+        "",
+        "Title:",
+        str(candidate.get("title")),
+        "",
+        "Hook:",
+        str(candidate.get("hook")),
+        "",
+        "Angle:",
+        str(candidate.get("angle")),
+        "",
+        "Risk:",
+        str(candidate.get("riskLevel")),
+        "",
+        "Needs context:",
+        "yes" if candidate.get("needsContext") else "no",
+        "",
+        "Context warning:",
+        str(candidate.get("contextWarning") or "-"),
+        "",
+        "Source credit:",
+        str(candidate.get("sourceCreditSuggestion") or source.get("creditText") or "-"),
+        "",
+        "Status:",
+        str(candidate.get("candidateStatus")),
+        "",
+        "Next actions:",
+        f"/candidate_approve {candidate.get('candidateId')}",
+        f"/candidate_reject {candidate.get('candidateId')} <reason>",
+        f"/generate_from_candidate {candidate.get('candidateId')}",
+    ]
+    return split_telegram_message("\n".join(lines).strip())
 
 
 def create_source(body: dict[str, Any]) -> dict[str, Any]:
@@ -3119,6 +3451,363 @@ def update_segment(item_segment_id: str, body: dict[str, Any]) -> dict[str, Any]
     SOURCE_STORE.save(source)
     LOGGER.info("segment_updated segment_id=%s", item_segment_id)
     return {**segment, "telegramMessages": format_segment_detail_for_telegram(source, segment)}
+
+
+def find_candidate(item_candidate_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    if not re.fullmatch(r"cand_\d{8}_[a-f0-9]{8}", item_candidate_id):
+        raise AppError(HTTPStatus.BAD_REQUEST, "invalid_candidate_id", "Candidate ID format is invalid.")
+    for source in SOURCE_STORE.list_records():
+        for candidate in source_candidates(source):
+            if candidate.get("candidateId") == item_candidate_id:
+                return source, candidate
+    raise AppError(HTTPStatus.NOT_FOUND, "candidate_not_found", "Candidate was not found.")
+
+
+def normalized_title(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+
+def validate_candidate_payload(item: dict[str, Any], source: dict[str, Any], transcript: dict[str, Any], default_segment_id: str = "") -> dict[str, Any]:
+    title = str(item.get("title") or "").strip()
+    hook = str(item.get("hook") or "").strip()
+    if not title or not hook:
+        raise AppError(HTTPStatus.BAD_GATEWAY, "ai_validation_failed", "AI candidate response is missing title or hook.")
+    risk = validate_risk_level(str(item.get("riskLevel") or "medium"))
+    try:
+        candidate_type = validate_candidate_type(str(item.get("candidateType") or "mixed"))
+    except AppError:
+        candidate_type = "mixed"
+    if candidate_type not in CANDIDATE_ALLOWED_TYPES:
+        candidate_type = "mixed"
+    reasoning = str(item.get("aiReasoningSummary") or "").strip()
+    if len(reasoning.split()) > 60:
+        reasoning = "Candidate dipilih karena relevan dengan sumber dan perlu ditinjau manual sebelum dipakai."
+    candidate = {
+        "candidateId": candidate_id(),
+        "sourceId": source["sourceId"],
+        "transcriptId": transcript.get("transcriptId", ""),
+        "segmentId": str(item.get("segmentId") or default_segment_id or "").strip(),
+        "candidateType": candidate_type,
+        "title": title[:140],
+        "hook": hook[:240],
+        "angle": str(item.get("angle") or "").strip()[:500],
+        "summary": str(item.get("summary") or "").strip()[:800],
+        "suggestedFormat": str(item.get("suggestedFormat") or candidate_type).strip(),
+        "suggestedDurationSeconds": parse_int(item.get("suggestedDurationSeconds"), 45, "suggestedDurationSeconds"),
+        "riskLevel": risk,
+        "needsContext": parse_bool(item.get("needsContext"), risk != "low"),
+        "contextWarning": str(item.get("contextWarning") or "").strip()[:500],
+        "sourceCreditSuggestion": str(item.get("sourceCreditSuggestion") or source.get("creditText") or "").strip(),
+        "candidateStatus": "suggested",
+        "aiReasoningSummary": reasoning[:500],
+        "contentLinks": [],
+        "rejectionReason": "",
+        "createdAt": now_iso(),
+        "updatedAt": now_iso(),
+    }
+    if candidate["riskLevel"] in {"medium", "high"} and not candidate["contextWarning"]:
+        candidate["contextWarning"] = "Review konteks sumber/segment secara manual sebelum dipakai."
+    return candidate
+
+
+def candidate_permission_warnings(source: dict[str, Any]) -> list[str]:
+    permission = str(source.get("permissionStatus") or "unknown")
+    status = str(source.get("sourceStatus") or "draft")
+    warnings = []
+    if status == "restricted" or permission in {"restricted", "rejected"}:
+        if CANDIDATE_BLOCK_RESTRICTED_SOURCE:
+            raise AppError(HTTPStatus.CONFLICT, "source_restricted", "Source is restricted or rejected.")
+        warnings.append("Source is restricted or rejected. Manual review is required.")
+    if permission == "unknown":
+        if not CANDIDATE_ALLOW_UNKNOWN_PERMISSION:
+            raise AppError(HTTPStatus.CONFLICT, "source_permission_unknown", "Source permission is unknown.")
+        warnings.append("Source permission is unknown. Review permission and credit before posting.")
+    if permission == "needs_permission":
+        warnings.append("Source needs permission. Do not publish without permission review.")
+    if permission == "allowed_for_dakwah":
+        warnings.append("Boleh disebarkan untuk dakwah belum tentu otomatis aman untuk monetisasi. Tetap beri sumber dan nilai tambah.")
+    return warnings
+
+
+def candidate_context_from_source(source: dict[str, Any], max_segments: int) -> tuple[dict[str, Any], str]:
+    transcript = source.get("transcript") if isinstance(source.get("transcript"), dict) else None
+    if not transcript or not transcript.get("transcriptText"):
+        raise AppError(HTTPStatus.NOT_FOUND, "transcript_not_found", "Transcript is required for highlight generation.")
+    segments = transcript.get("segments") if isinstance(transcript.get("segments"), list) else []
+    if segments:
+        selected = segments[:max_segments]
+        context = "\n\n".join(
+            f"segmentId={segment.get('segmentId')} risk={segment.get('riskLevel')}\n{segment.get('text')}"
+            for segment in selected
+        )
+    else:
+        context = str(transcript.get("transcriptText") or "")
+    if len(context) > CANDIDATE_MAX_TRANSCRIPT_CHARS:
+        context = context[:CANDIDATE_MAX_TRANSCRIPT_CHARS] + "\n\n[Transcript truncated for analysis. Manual review required.]"
+    return transcript, context
+
+
+def save_candidates(source: dict[str, Any], new_candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    candidates = source.get("candidates")
+    if not isinstance(candidates, list):
+        candidates = []
+        source["candidates"] = candidates
+    existing_titles = {normalized_title(str(item.get("title") or "")) for item in candidates if isinstance(item, dict)}
+    saved = []
+    for candidate in new_candidates:
+        key = normalized_title(candidate["title"])
+        if not key or key in existing_titles:
+            continue
+        candidates.append(candidate)
+        existing_titles.add(key)
+        saved.append(candidate)
+    source["updatedAt"] = now_iso()
+    SOURCE_STORE.save(source)
+    LOGGER.info("candidates_saved source_id=%s count=%d", source.get("sourceId"), len(saved))
+    return saved
+
+
+def generate_highlights_from_source(source_id_value: str, body: dict[str, Any]) -> dict[str, Any]:
+    source = SOURCE_STORE.get(source_id_value)
+    warnings = candidate_permission_warnings(source)
+    candidate_count = max(1, min(parse_int(body.get("candidateCount"), CANDIDATE_DEFAULT_COUNT, "candidateCount"), 10))
+    preferred = body.get("preferredTypes")
+    preferred_types = [validate_candidate_type(str(item)) for item in preferred] if isinstance(preferred, list) else sorted(CANDIDATE_ALLOWED_TYPES)
+    transcript, context = candidate_context_from_source(source, min(parse_int(body.get("maxSegments"), CANDIDATE_MAX_SEGMENTS_PER_RUN, "maxSegments"), CANDIDATE_MAX_SEGMENTS_PER_RUN))
+    LOGGER.info("highlight_generation_requested source_id=%s", source_id_value)
+    result = call_ai_json(
+        [
+            {"role": "system", "content": system_prompt()},
+            {
+                "role": "user",
+                "content": highlight_candidates_prompt(
+                    source,
+                    transcript,
+                    context,
+                    candidate_count=candidate_count,
+                    preferred_types=preferred_types,
+                ),
+            },
+        ]
+    )
+    raw_candidates = result.get("candidates")
+    if not isinstance(raw_candidates, list) or not raw_candidates:
+        raise AppError(HTTPStatus.BAD_GATEWAY, "ai_no_candidates", "AI returned no candidates.")
+    candidates = [validate_candidate_payload(item, source, transcript) for item in raw_candidates if isinstance(item, dict)]
+    allow_high_risk = parse_bool(body.get("allowHighRisk"), CANDIDATE_ALLOW_HIGH_RISK)
+    candidates = [item for item in candidates if allow_high_risk or item["riskLevel"] != "high"]
+    if not candidates:
+        raise AppError(HTTPStatus.CONFLICT, "high_risk_candidate_blocked", "Only high-risk candidates were returned and high-risk candidates are blocked.")
+    saved = save_candidates(source, candidates[:candidate_count])
+    if not saved:
+        raise AppError(HTTPStatus.CONFLICT, "duplicate_candidate", "No new candidates were saved.")
+    lines = ["Highlight Candidates Generated", "", "Source:", source_id_value, "", "Title:", str(source.get("title")), "", "Candidates:", ""]
+    for index, candidate in enumerate(saved, start=1):
+        lines.extend([f"{index}. {candidate['candidateId']}", f"Type: {candidate['candidateType']}", f"Title: {candidate['title']}", f"Risk: {candidate['riskLevel']}", f"Needs context: {'yes' if candidate['needsContext'] else 'no'}", ""])
+    if warnings:
+        lines.extend(["Warnings:", *[f"- {warning}" for warning in warnings], ""])
+    lines.extend(["Next actions:", f"/candidate {saved[0]['candidateId']}", f"/candidate_approve {saved[0]['candidateId']}", f"/generate_from_candidate {saved[0]['candidateId']}", "", "Reminder:", "Review kembali konteks sebelum upload agar tidak salah makna."])
+    return {"sourceId": source_id_value, "analysisSummary": result.get("analysisSummary", ""), "warnings": warnings, "candidates": saved, "telegramMessages": split_telegram_message("\n".join(lines).strip())}
+
+
+def generate_highlights_from_segment(item_segment_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    source, transcript, segment = SOURCE_STORE.find_segment(item_segment_id)
+    warnings = candidate_permission_warnings(source)
+    if segment.get("riskLevel") == "high":
+        warnings.append("Segment risk is high. Manual context review is required.")
+    candidate_count = max(1, min(parse_int(body.get("candidateCount"), 5, "candidateCount"), 5))
+    result = call_ai_json(
+        [
+            {"role": "system", "content": system_prompt()},
+            {
+                "role": "user",
+                "content": highlight_candidates_prompt(
+                    source,
+                    transcript,
+                    str(segment.get("text") or ""),
+                    candidate_count=candidate_count,
+                    preferred_types=sorted(CANDIDATE_ALLOWED_TYPES),
+                    segment=segment,
+                ),
+            },
+        ]
+    )
+    raw_candidates = result.get("candidates")
+    if not isinstance(raw_candidates, list) or not raw_candidates:
+        raise AppError(HTTPStatus.BAD_GATEWAY, "ai_no_candidates", "AI returned no candidates.")
+    candidates = [validate_candidate_payload(item, source, transcript, item_segment_id) for item in raw_candidates if isinstance(item, dict)]
+    allow_high_risk = parse_bool(body.get("allowHighRisk"), CANDIDATE_ALLOW_HIGH_RISK)
+    candidates = [item for item in candidates if allow_high_risk or item["riskLevel"] != "high"]
+    if not candidates:
+        raise AppError(HTTPStatus.CONFLICT, "high_risk_candidate_blocked", "Only high-risk candidates were returned and high-risk candidates are blocked.")
+    saved = save_candidates(source, candidates[:candidate_count])
+    if not saved:
+        raise AppError(HTTPStatus.CONFLICT, "duplicate_candidate", "No new candidates were saved.")
+    return {"sourceId": source["sourceId"], "segmentId": item_segment_id, "warnings": warnings, "candidates": saved, "telegramMessages": format_candidates_for_telegram(source, saved)}
+
+
+def list_candidates_for_source(source_id_value: str, status: str = "") -> dict[str, Any]:
+    source = SOURCE_STORE.get(source_id_value)
+    if status:
+        status = validate_candidate_status(status)
+    candidates = [candidate for candidate in source_candidates(source) if not status or candidate.get("candidateStatus") == status]
+    return {"sourceId": source_id_value, "candidates": candidates, "telegramMessages": format_candidates_for_telegram(source, candidates)}
+
+
+def list_candidates_by_status(status: str = "", limit: int = 20) -> dict[str, Any]:
+    if status:
+        status = validate_candidate_status(status)
+    items = []
+    for source in SOURCE_STORE.list_records():
+        for candidate in source_candidates(source):
+            if status and candidate.get("candidateStatus") != status:
+                continue
+            items.append((source, candidate))
+    items.sort(key=lambda pair: str(pair[1].get("createdAt") or ""), reverse=True)
+    selected = items[: max(1, min(limit, 100))]
+    lines = ["Candidate List", "", "Status:", status or "all", ""]
+    for index, (_source, candidate) in enumerate(selected, start=1):
+        lines.append(f"{index}. {candidate.get('candidateId')} - {candidate.get('title')} ({candidate.get('candidateStatus')})")
+    if not selected:
+        lines.append("No candidates found.")
+    return {"status": status or "all", "candidates": [candidate for _source, candidate in selected], "telegramMessages": split_telegram_message("\n".join(lines).strip())}
+
+
+def approve_candidate(item_candidate_id: str) -> dict[str, Any]:
+    source, candidate = find_candidate(item_candidate_id)
+    if candidate.get("candidateStatus") == "rejected":
+        raise AppError(HTTPStatus.CONFLICT, "candidate_already_rejected", "Rejected candidate cannot be approved without manual status change.")
+    candidate["candidateStatus"] = "approved"
+    candidate["updatedAt"] = now_iso()
+    source["updatedAt"] = now_iso()
+    SOURCE_STORE.save(source)
+    LOGGER.info("candidate_approved candidate_id=%s", item_candidate_id)
+    return {**candidate, "telegramMessages": split_telegram_message(f"Candidate approved.\n\nNext action:\n/generate_from_candidate {item_candidate_id}")}
+
+
+def reject_candidate(item_candidate_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    reason = str(body.get("reason") or "").strip()
+    source, candidate = find_candidate(item_candidate_id)
+    candidate["candidateStatus"] = "rejected"
+    candidate["rejectionReason"] = reason
+    candidate["updatedAt"] = now_iso()
+    source["updatedAt"] = now_iso()
+    SOURCE_STORE.save(source)
+    LOGGER.info("candidate_rejected candidate_id=%s", item_candidate_id)
+    return {**candidate, "telegramMessages": split_telegram_message(f"Candidate rejected.\n\nReason:\n{reason or '-'}")}
+
+
+def generate_content_from_candidate(item_candidate_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    source, candidate = find_candidate(item_candidate_id)
+    if candidate.get("candidateStatus") == "rejected":
+        raise AppError(HTTPStatus.CONFLICT, "candidate_already_rejected", "Candidate is rejected.")
+    if candidate.get("candidateStatus") == "converted_to_content":
+        raise AppError(HTTPStatus.CONFLICT, "candidate_already_converted", "Candidate has already been converted to content.")
+    if candidate.get("candidateStatus") != "approved":
+        raise AppError(HTTPStatus.CONFLICT, "candidate_not_approved", "Candidate must be approved before content generation.")
+    allow_high_risk = parse_bool(body.get("allowHighRisk"), CANDIDATE_ALLOW_HIGH_RISK)
+    if candidate.get("riskLevel") == "high" and not allow_high_risk:
+        raise AppError(HTTPStatus.CONFLICT, "high_risk_candidate_blocked", "High-risk candidate is blocked by configuration.")
+    transcript = source.get("transcript") if isinstance(source.get("transcript"), dict) else {}
+    segment = None
+    if candidate.get("segmentId"):
+        try:
+            _source, _transcript, segment = SOURCE_STORE.find_segment(str(candidate["segmentId"]))
+        except AppError:
+            segment = None
+    content = call_ai_json(
+        [
+            {"role": "system", "content": system_prompt()},
+            {"role": "user", "content": candidate_content_prompt(source, transcript, candidate, segment)},
+        ]
+    )
+    content = validate_content(content)
+    warnings = []
+    if candidate.get("needsContext"):
+        warnings.append(str(candidate.get("contextWarning") or "Review candidate context manually."))
+    if candidate.get("riskLevel") in {"medium", "high"}:
+        warnings.append(f"Candidate risk is {candidate.get('riskLevel')}. Manual review required.")
+    content["safetyNotes"].extend([warning for warning in warnings if warning])
+    item_id = content_id()
+    record = {
+        "id": item_id,
+        "status": "needs_review",
+        "topic": candidate.get("title") or source.get("topic") or source.get("title"),
+        "niche": "annotasi_hikmah",
+        "tone": "calm_reflective",
+        "platform": "instagram",
+        "content": content,
+        "createdAt": now_iso(),
+        "updatedAt": now_iso(),
+    }
+    ensure_workflow(record)
+    set_workflow_status(record, "needs_review")
+    transcript_dict = transcript if isinstance(transcript, dict) else None
+    source_link = link_source_to_content(record, source, transcript_dict, segment)
+    candidate_link = {"candidateId": item_candidate_id, "contentId": item_id, "createdAt": now_iso()}
+    record["candidateLink"] = {**candidate_link, "sourceId": source.get("sourceId"), "segmentId": candidate.get("segmentId"), "riskLevel": candidate.get("riskLevel")}
+    links = candidate.get("contentLinks")
+    if not isinstance(links, list):
+        links = []
+        candidate["contentLinks"] = links
+    links.append(candidate_link)
+    candidate["candidateStatus"] = "converted_to_content"
+    candidate["updatedAt"] = now_iso()
+    source["updatedAt"] = now_iso()
+    SOURCE_STORE.save(source)
+    STORE.save(record)
+    LOGGER.info("content_generated_from_candidate candidate_id=%s content_id=%s", item_candidate_id, item_id)
+    lines = [
+        "Content Generated from Candidate",
+        "",
+        "Content ID:",
+        item_id,
+        "",
+        "Candidate:",
+        item_candidate_id,
+        "",
+        "Title:",
+        str(content.get("title")),
+        "",
+        "Status:",
+        "needs_review",
+        "",
+        "Next actions:",
+        f"/review {item_id}",
+        f"/approve {item_id}",
+        f"/render {item_id}",
+        "",
+        "Reminder:",
+        "Review kembali sebelum upload agar tidak salah konteks.",
+    ]
+    return {"id": item_id, "status": "needs_review", "content": content, "sourceLink": source_link, "candidateLink": record["candidateLink"], "warnings": warnings, "telegramMessages": split_telegram_message("\n".join(lines).strip())}
+
+
+def candidate_for_content(item_id: str) -> dict[str, Any]:
+    record = STORE.get(item_id)
+    link = record.get("candidateLink")
+    if not isinstance(link, dict) or not link.get("candidateId"):
+        raise AppError(HTTPStatus.NOT_FOUND, "candidate_link_not_found", "Content has no linked candidate.")
+    source, candidate = find_candidate(str(link["candidateId"]))
+    lines = [
+        "Content Candidate",
+        "",
+        "Content ID:",
+        item_id,
+        "",
+        "Candidate ID:",
+        str(candidate.get("candidateId")),
+        "",
+        "Source:",
+        str(source.get("sourceId")),
+        "",
+        "Segment:",
+        str(candidate.get("segmentId") or "none"),
+        "",
+        "Risk:",
+        str(candidate.get("riskLevel")),
+    ]
+    return {"contentId": item_id, "candidate": candidate, "source": source_summary(source), "telegramMessages": split_telegram_message("\n".join(lines).strip())}
 
 
 def ensure_source_generation_allowed(source: dict[str, Any], override: bool = False) -> list[str]:
@@ -3488,10 +4177,28 @@ class AnnotasiHandler(BaseHTTPRequestHandler):
             json_response(self, HTTPStatus.OK, list_sources(params))
             return
 
+        if path == "/api/v1/candidate-list":
+            status = params.get("status", [""])[0].strip()
+            limit = parse_int(params.get("limit", ["20"])[0], 20, "limit")
+            json_response(self, HTTPStatus.OK, list_candidates_by_status(status, limit))
+            return
+
+        candidate_detail_match = re.fullmatch(r"/api/v1/candidates/(cand_\d{8}_[a-f0-9]{8})", path)
+        if candidate_detail_match:
+            source, candidate = find_candidate(candidate_detail_match.group(1))
+            json_response(self, HTTPStatus.OK, {**candidate, "source": source_summary(source), "telegramMessages": format_candidate_detail_for_telegram(source, candidate)})
+            return
+
         source_review_match = re.fullmatch(r"/api/v1/sources/(src_\d{8}_[a-f0-9]{8})/review", path)
         if source_review_match:
             source = SOURCE_STORE.get(source_review_match.group(1))
             json_response(self, HTTPStatus.OK, {**source, "telegramMessages": format_source_review_for_telegram(source)})
+            return
+
+        source_candidates_match = re.fullmatch(r"/api/v1/sources/(src_\d{8}_[a-f0-9]{8})/candidates", path)
+        if source_candidates_match:
+            status = params.get("status", [""])[0].strip()
+            json_response(self, HTTPStatus.OK, list_candidates_for_source(source_candidates_match.group(1), status))
             return
 
         source_transcript_match = re.fullmatch(r"/api/v1/sources/(src_\d{8}_[a-f0-9]{8})/transcript", path)
@@ -3582,6 +4289,11 @@ class AnnotasiHandler(BaseHTTPRequestHandler):
             json_response(self, HTTPStatus.OK, source_for_content(content_source_match.group(1)))
             return
 
+        content_candidate_match = re.fullmatch(r"/api/v1/content/(cnt_\d{8}_[a-f0-9]{8})/candidate", path)
+        if content_candidate_match:
+            json_response(self, HTTPStatus.OK, candidate_for_content(content_candidate_match.group(1)))
+            return
+
         match = re.fullmatch(r"/api/v1/content/(cnt_\d{8}_[a-f0-9]{8})(?:/(caption|voiceover|voiceover-script))?", path)
         if not match:
             raise AppError(HTTPStatus.NOT_FOUND, "not_found", "Route not found.")
@@ -3610,6 +4322,26 @@ class AnnotasiHandler(BaseHTTPRequestHandler):
         body = read_json_body(self)
         if path == "/api/v1/sources":
             json_response(self, HTTPStatus.OK, create_source(body))
+            return
+        source_highlights_match = re.fullmatch(r"/api/v1/sources/(src_\d{8}_[a-f0-9]{8})/highlights", path)
+        if source_highlights_match:
+            json_response(self, HTTPStatus.OK, generate_highlights_from_source(source_highlights_match.group(1), body))
+            return
+        segment_highlights_match = re.fullmatch(r"/api/v1/segments/(seg_\d{8}_[a-f0-9]{8})/highlights", path)
+        if segment_highlights_match:
+            json_response(self, HTTPStatus.OK, generate_highlights_from_segment(segment_highlights_match.group(1), body))
+            return
+        candidate_approve_match = re.fullmatch(r"/api/v1/candidates/(cand_\d{8}_[a-f0-9]{8})/approve", path)
+        if candidate_approve_match:
+            json_response(self, HTTPStatus.OK, approve_candidate(candidate_approve_match.group(1)))
+            return
+        candidate_reject_match = re.fullmatch(r"/api/v1/candidates/(cand_\d{8}_[a-f0-9]{8})/reject", path)
+        if candidate_reject_match:
+            json_response(self, HTTPStatus.OK, reject_candidate(candidate_reject_match.group(1), body))
+            return
+        candidate_generate_match = re.fullmatch(r"/api/v1/candidates/(cand_\d{8}_[a-f0-9]{8})/generate-content", path)
+        if candidate_generate_match:
+            json_response(self, HTTPStatus.OK, generate_content_from_candidate(candidate_generate_match.group(1), body))
             return
         source_approve_match = re.fullmatch(r"/api/v1/sources/(src_\d{8}_[a-f0-9]{8})/approve", path)
         if source_approve_match:
