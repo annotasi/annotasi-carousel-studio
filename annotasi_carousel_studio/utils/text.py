@@ -52,10 +52,71 @@ def parse_bool(value: Any, default: bool = False) -> bool:
 
 def strip_json_fence(text: str) -> str:
     stripped = text.strip()
+    fence_match = re.fullmatch(r"```(?:\s*json)?\s*\n?(.*?)\n?\s*```", stripped, flags=re.IGNORECASE | re.DOTALL)
+    if fence_match:
+        return fence_match.group(1).strip()
     if stripped.startswith("```"):
-        stripped = re.sub(r"^```(?:json)?\s*", "", stripped, flags=re.IGNORECASE)
-        stripped = re.sub(r"\s*```$", "", stripped)
+        stripped = re.sub(r"^```\s*(?:json)?\s*\n?", "", stripped, flags=re.IGNORECASE)
+        stripped = re.sub(r"\n?\s*```$", "", stripped)
     return stripped.strip()
+
+
+def _extract_balanced_json_candidate(text: str, start: int) -> str:
+    opener = text[start]
+    closer = "}" if opener == "{" else "]"
+    stack = [closer]
+    in_string = False
+    escaped = False
+    for index in range(start + 1, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            stack.append("}")
+        elif char == "[":
+            stack.append("]")
+        elif char in {"}", "]"}:
+            if not stack or char != stack[-1]:
+                raise ValueError("Unbalanced JSON delimiters.")
+            stack.pop()
+            if not stack:
+                return text[start : index + 1]
+    raise ValueError("No balanced JSON value found.")
+
+
+def extract_first_json_value(text: str) -> Any:
+    stripped = text.strip()
+    if not stripped:
+        raise ValueError("Empty AI response.")
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError as direct_error:
+        parse_error: Exception = direct_error
+
+    fenced = strip_json_fence(stripped)
+    if fenced != stripped:
+        try:
+            return json.loads(fenced)
+        except json.JSONDecodeError as fenced_error:
+            parse_error = fenced_error
+
+    starts = [(index, char) for index, char in enumerate(stripped) if char in "{["]
+    for index, _char in starts:
+        try:
+            candidate = _extract_balanced_json_candidate(stripped, index)
+            return json.loads(candidate)
+        except (ValueError, json.JSONDecodeError) as scan_error:
+            parse_error = scan_error
+            continue
+    raise ValueError(str(parse_error))
 
 
 def normalize_hashtags(value: Any) -> list[str]:
