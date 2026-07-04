@@ -31,11 +31,13 @@ def _content_from_message_parts(parts: list[Any]) -> str:
     return "\n".join(texts)
 
 
-def extract_ai_response_payload(envelope: Any) -> Any:
+def extract_ai_generated_text(envelope: Any) -> Any:
     if not isinstance(envelope, dict):
         return envelope
     choices = envelope.get("choices")
-    if isinstance(choices, list) and choices:
+    if "choices" in envelope:
+        if not isinstance(choices, list) or not choices:
+            raise ValueError("AI response choices is empty or invalid.")
         first = choices[0]
         if isinstance(first, dict):
             message = first.get("message")
@@ -46,11 +48,77 @@ def extract_ai_response_payload(envelope: Any) -> Any:
                 return content
             if "text" in first:
                 return first.get("text")
+        raise ValueError("AI response choices did not contain generated text.")
     if "output_text" in envelope:
         return envelope.get("output_text")
     if "content" in envelope:
         return envelope.get("content")
     return envelope
+
+
+def extract_ai_response_payload(envelope: Any) -> Any:
+    return extract_ai_generated_text(envelope)
+
+def _has_carousel_schema(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and isinstance(value.get("title"), str)
+        and isinstance(value.get("slides"), list)
+    )
+
+
+def normalize_ai_content_payload(value: Any) -> Any:
+    """
+    Normalize common AI/provider wrapper shapes into the carousel content object.
+
+    This does not fabricate missing fields. It only unwraps known containers.
+    If no valid carousel-shaped object is found, the original value is returned
+    so the existing validator can fail normally.
+    """
+    if _has_carousel_schema(value):
+        return value
+
+    if isinstance(value, dict):
+        for key in ("content", "carousel", "data", "result", "output", "response"):
+            nested = value.get(key)
+            if _has_carousel_schema(nested):
+                return nested
+
+            if isinstance(nested, str):
+                try:
+                    nested_parsed = extract_first_json_value(nested)
+                except Exception:
+                    continue
+                normalized = normalize_ai_content_payload(nested_parsed)
+                if _has_carousel_schema(normalized):
+                    return normalized
+
+        choices = value.get("choices")
+        if isinstance(choices, list) and choices:
+            generated = extract_ai_response_payload(value)
+            if isinstance(generated, str):
+                try:
+                    generated_parsed = extract_first_json_value(generated)
+                except Exception:
+                    return value
+                normalized = normalize_ai_content_payload(generated_parsed)
+                if _has_carousel_schema(normalized):
+                    return normalized
+            elif isinstance(generated, (dict, list)):
+                normalized = normalize_ai_content_payload(generated)
+                if _has_carousel_schema(normalized):
+                    return normalized
+
+    return value
+
+
+def log_ai_json_shape(value: Any, label: str = "ai_json_parsed") -> None:
+    if isinstance(value, dict):
+        LOGGER.info("%s parsed_type=dict keys=%s", label, list(value.keys())[:30])
+    elif isinstance(value, list):
+        LOGGER.info("%s parsed_type=list length=%s", label, len(value))
+    else:
+        LOGGER.info("%s parsed_type=%s", label, type(value).__name__)
 
 
 def call_ai_json(messages: list[dict[str, str]]) -> dict[str, Any]:
@@ -119,7 +187,7 @@ def call_ai_json(messages: list[dict[str, str]]) -> dict[str, Any]:
                     _preview(envelope),
                 )
                 raise AppError(HTTPStatus.BAD_GATEWAY, "ai_http_error", "AI endpoint returned an error.")
-            generated = extract_ai_response_payload(envelope)
+            generated = extract_ai_generated_text(envelope)
             if isinstance(generated, (dict, list)):
                 parsed = generated
             elif isinstance(generated, str):
@@ -135,6 +203,10 @@ def call_ai_json(messages: list[dict[str, str]]) -> dict[str, Any]:
             _preview(raw),
         )
         raise AppError(HTTPStatus.BAD_GATEWAY, "ai_invalid_json", "AI returned invalid JSON.") from exc
+    log_ai_json_shape(parsed, "ai_json_parsed_before_normalize")
+    parsed = normalize_ai_content_payload(parsed)
+    log_ai_json_shape(parsed, "ai_json_parsed_after_normalize")
+
     if not isinstance(parsed, dict):
         LOGGER.warning(
             "ai_invalid_json status=%s content_type=%s parse_error=%s preview=%r",
@@ -144,4 +216,5 @@ def call_ai_json(messages: list[dict[str, str]]) -> dict[str, Any]:
             _preview(parsed),
         )
         raise AppError(HTTPStatus.BAD_GATEWAY, "ai_invalid_json", "AI JSON response must be an object.")
+
     return parsed

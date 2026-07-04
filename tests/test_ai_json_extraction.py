@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from annotasi_carousel_studio.ai.client import extract_ai_response_payload
+from annotasi_carousel_studio.ai.client import extract_ai_generated_text
 from annotasi_carousel_studio.utils.text import extract_first_json_value, strip_json_fence
 
 
@@ -53,27 +53,31 @@ class JsonExtractionTests(unittest.TestCase):
 
     def test_chat_completion_wrapper(self) -> None:
         envelope = {"choices": [{"message": {"content": '{"title":"Test","slides":[]}'}}]}
-        payload = extract_ai_response_payload(envelope)
+        payload = extract_ai_generated_text(envelope)
         self.assertEqual(extract_first_json_value(payload)["title"], "Test")
 
     def test_completion_text_wrapper(self) -> None:
         envelope = {"choices": [{"text": '{"title":"Test","slides":[]}'}]}
-        payload = extract_ai_response_payload(envelope)
+        payload = extract_ai_generated_text(envelope)
         self.assertEqual(extract_first_json_value(payload)["title"], "Test")
 
     def test_output_text_wrapper(self) -> None:
         envelope = {"output_text": '{"title":"Test","slides":[]}'}
-        payload = extract_ai_response_payload(envelope)
+        payload = extract_ai_generated_text(envelope)
         self.assertEqual(extract_first_json_value(payload)["title"], "Test")
 
     def test_direct_content_wrapper(self) -> None:
         envelope = {"content": '{"title":"Test","slides":[]}'}
-        payload = extract_ai_response_payload(envelope)
+        payload = extract_ai_generated_text(envelope)
         self.assertEqual(extract_first_json_value(payload)["title"], "Test")
 
     def test_already_parsed_json_object(self) -> None:
         envelope = {"title": "Test", "slides": []}
-        self.assertEqual(extract_ai_response_payload(envelope)["title"], "Test")
+        self.assertEqual(extract_ai_generated_text(envelope)["title"], "Test")
+
+    def test_choices_wrapper_without_content_is_not_returned_directly(self) -> None:
+        with self.assertRaises(ValueError):
+            extract_ai_generated_text({"choices": [{"message": {}}]})
 
 
 if __name__ == "__main__":

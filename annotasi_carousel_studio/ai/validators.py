@@ -9,19 +9,47 @@ from ..utils.ids import *
 from ..utils.time import *
 from ..utils.text import *
 from ..utils.media import *
+
+
+def _validation_keys(value: Any) -> Optional[list[str]]:
+    return list(value.keys())[:20] if isinstance(value, dict) else None
+
+
+def _raise_validation(message: str, parsed: Any) -> None:
+    LOGGER.warning(
+        "ai_validation_failed reason=%s parsed_type=%s keys=%s",
+        message,
+        type(parsed).__name__,
+        _validation_keys(parsed),
+    )
+    raise ValidationError(message)
+
+
 def validate_content(content: dict[str, Any]) -> dict[str, Any]:
     required_strings = ["title", "niche", "tone", "caption", "voiceoverScript", "sourceCreditSuggestion", "callToAction"]
     for key in required_strings:
         if not isinstance(content.get(key), str) or not content[key].strip():
+            if isinstance(content, dict):
+                LOGGER.warning(
+                    "ai_validation_failed missing_field=%s parsed_type=dict keys=%s",
+                    key,
+                    list(content.keys())[:30],
+                )
+            else:
+                LOGGER.warning(
+                    "ai_validation_failed missing_field=%s parsed_type=%s",
+                    key,
+                    type(content).__name__,
+                )
             raise ValidationError(f"Missing or invalid field: {key}")
         content[key] = content[key].strip()
 
     slides = content.get("slides")
     if not isinstance(slides, list) or not 5 <= len(slides) <= 8:
-        raise ValidationError("slides must contain 5 to 8 items.")
+        _raise_validation("slides must contain 5 to 8 items.", content)
     for index, slide in enumerate(slides, start=1):
         if not isinstance(slide, dict):
-            raise ValidationError("Each slide must be an object.")
+            _raise_validation("Each slide must be an object.", content)
         slide["slideNumber"] = parse_int(
             slide.get("slideNumber"),
             index,
@@ -32,20 +60,20 @@ def validate_content(content: dict[str, Any]) -> dict[str, Any]:
         if slide["slideNumber"] != index:
             slide["slideNumber"] = index
         if slide.get("type") not in {"hook", "body", "closing"}:
-            raise ValidationError(f"Invalid slide type at slide {index}.")
+            _raise_validation(f"Invalid slide type at slide {index}.", content)
         for key in ["text", "visualDirection"]:
             if not isinstance(slide.get(key), str) or not slide[key].strip():
-                raise ValidationError(f"Missing {key} at slide {index}.")
+                _raise_validation(f"Missing {key} at slide {index}.", content)
             slide[key] = slide[key].strip()
         if word_count(slide["text"]) > 25:
-            raise ValidationError(f"Slide {index} exceeds 25 words.")
+            _raise_validation(f"Slide {index} exceeds 25 words.", content)
 
     storyboard = content.get("videoStoryboard")
     if not isinstance(storyboard, list) or not storyboard:
-        raise ValidationError("videoStoryboard must contain at least one scene.")
+        _raise_validation("videoStoryboard must contain at least one scene.", content)
     for index, scene in enumerate(storyboard, start=1):
         if not isinstance(scene, dict):
-            raise ValidationError("Each storyboard scene must be an object.")
+            _raise_validation("Each storyboard scene must be an object.", content)
         scene["sceneNumber"] = parse_int(
             scene.get("sceneNumber"),
             index,
@@ -62,12 +90,12 @@ def validate_content(content: dict[str, Any]) -> dict[str, Any]:
         )
         for key in ["visual", "motion", "voiceoverPart"]:
             if not isinstance(scene.get(key), str) or not scene[key].strip():
-                raise ValidationError(f"Missing {key} at scene {index}.")
+                _raise_validation(f"Missing {key} at scene {index}.", content)
             scene[key] = scene[key].strip()
 
     content["hashtags"] = normalize_hashtags(content.get("hashtags"))
     if not content["hashtags"]:
-        raise ValidationError("hashtags must contain at least one tag.")
+        _raise_validation("hashtags must contain at least one tag.", content)
 
     notes = content.get("safetyNotes")
     if isinstance(notes, list):
