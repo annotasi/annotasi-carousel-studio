@@ -16,6 +16,7 @@ This is intentionally a small HTTP service instead of a Hermes patch because the
 - Stores render metadata beside the existing content JSON record.
 - Converts completed PNG carousel renders into 1080x1920 vertical MP4 videos for Shorts/Reels/TikTok.
 - Mixes a user-provided voiceover audio file into the latest completed MP4 video.
+- Adds review/edit workflow status, render staleness, upload markers, and a simple content calendar.
 
 ## Files
 
@@ -66,6 +67,10 @@ AUDIO_NORMALIZE_ENABLED=true
 AUDIO_DEFAULT_FIT_MODE=trim_or_pad
 AUDIO_RENDER_TIMEOUT_SECONDS=180
 AUDIO_OUTPUT_CODEC=aac
+CONTENT_TIMEZONE=Asia/Jakarta
+CONTENT_DEFAULT_CALENDAR_DAYS=7
+CONTENT_ALLOW_SCHEDULE_REJECTED=false
+CONTENT_REQUIRE_APPROVAL_BEFORE_SCHEDULE=true
 ```
 
 The service logs whether an API key is configured, but never logs the key value.
@@ -267,6 +272,104 @@ curl -s http://127.0.0.1:8097/api/v1/content/cnt_20260704_ab12cd34/audio/latest
 curl -s http://127.0.0.1:8097/api/v1/audio-render/aud_20260704_ab12cd34
 ```
 
+### Review Content
+
+```sh
+curl -s http://127.0.0.1:8097/api/v1/content/cnt_20260704_ab12cd34/review
+```
+
+### Approve or Reject
+
+```sh
+curl -s -X POST http://127.0.0.1:8097/api/v1/content/cnt_20260704_ab12cd34/approve \
+  -H 'Content-Type: application/json' \
+  -d '{"reviewedBy":"internal","notes":"checked"}'
+```
+
+```sh
+curl -s http://127.0.0.1:8097/api/v1/content/cnt_20260704_ab12cd34/reject \
+  -H 'Content-Type: application/json' \
+  -d '{"reason":"terlalu umum dan kurang kuat"}'
+```
+
+### Edit Content
+
+```sh
+curl -s -X PATCH http://127.0.0.1:8097/api/v1/content/cnt_20260704_ab12cd34/slides/3 \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"Rezeki bukan hanya soal banyak, tapi juga soal halal, tenang, dan berkah."}'
+```
+
+```sh
+curl -s -X PATCH http://127.0.0.1:8097/api/v1/content/cnt_20260704_ab12cd34/caption \
+  -H 'Content-Type: application/json' \
+  -d '{"caption":"Caption baru..."}'
+```
+
+```sh
+curl -s -X PATCH http://127.0.0.1:8097/api/v1/content/cnt_20260704_ab12cd34/voiceover \
+  -H 'Content-Type: application/json' \
+  -d '{"voiceoverScript":"Script voiceover baru..."}'
+```
+
+### Status
+
+```sh
+curl -s http://127.0.0.1:8097/api/v1/content/cnt_20260704_ab12cd34/status
+```
+
+Manual status update:
+
+```sh
+curl -s -X PATCH http://127.0.0.1:8097/api/v1/content/cnt_20260704_ab12cd34/status \
+  -H 'Content-Type: application/json' \
+  -d '{"status":"approved"}'
+```
+
+### Schedule
+
+```sh
+curl -s http://127.0.0.1:8097/api/v1/content/cnt_20260704_ab12cd34/schedule \
+  -H 'Content-Type: application/json' \
+  -d '{"platform":"instagram","scheduledDate":"2026-07-05","scheduledTime":null,"timezone":"Asia/Jakarta"}'
+```
+
+Unschedule:
+
+```sh
+curl -s -X DELETE http://127.0.0.1:8097/api/v1/content/cnt_20260704_ab12cd34/schedule
+```
+
+### Calendar
+
+```sh
+curl -s 'http://127.0.0.1:8097/api/v1/calendar?from=2026-07-04&to=2026-07-11'
+```
+
+Shortcuts:
+
+```sh
+curl -s http://127.0.0.1:8097/api/v1/calendar/today
+curl -s http://127.0.0.1:8097/api/v1/calendar/week
+curl -s http://127.0.0.1:8097/api/v1/calendar/month
+curl -s http://127.0.0.1:8097/api/v1/calendar/next
+```
+
+### Uploaded
+
+```sh
+curl -s http://127.0.0.1:8097/api/v1/content/cnt_20260704_ab12cd34/uploaded \
+  -H 'Content-Type: application/json' \
+  -d '{"platform":"instagram","url":"https://instagram.com/example"}'
+```
+
+### Content List
+
+```sh
+curl -s http://127.0.0.1:8097/api/v1/content-list
+curl -s 'http://127.0.0.1:8097/api/v1/content-list?status=needs_review'
+```
+
 ## Hermes Integration
 
 Recommended Telegram command mapping:
@@ -290,6 +393,22 @@ Recommended Telegram command mapping:
 | `/mixvoice_file <content_id> <audio_file_path>` | `POST /api/v1/content/{content_id}/audio/mix` |
 | `/audio_list <content_id>` | `GET /api/v1/content/{content_id}/audio/latest` |
 | `/audio_status <audio_render_id>` | `GET /api/v1/audio-render/{audio_render_id}` |
+| `/review <content_id>` | `GET /api/v1/content/{content_id}/review` |
+| `/approve <content_id>` | `POST /api/v1/content/{content_id}/approve` |
+| `/reject <content_id> <reason>` | `POST /api/v1/content/{content_id}/reject` |
+| `/status <content_id>` | `GET /api/v1/content/{content_id}/status` |
+| `/edit_slide <content_id> <slide_number> <text>` | `PATCH /api/v1/content/{content_id}/slides/{slide_number}` |
+| `/edit_caption <content_id> <text>` | `PATCH /api/v1/content/{content_id}/caption` |
+| `/edit_voiceover <content_id> <text>` | `PATCH /api/v1/content/{content_id}/voiceover` |
+| `/schedule <content_id> <YYYY-MM-DD> <platform>` | `POST /api/v1/content/{content_id}/schedule` |
+| `/unschedule <content_id>` | `DELETE /api/v1/content/{content_id}/schedule` |
+| `/calendar today` | `GET /api/v1/calendar/today` |
+| `/calendar week` | `GET /api/v1/calendar/week` |
+| `/calendar month` | `GET /api/v1/calendar/month` |
+| `/today` | `GET /api/v1/calendar/today` |
+| `/next` | `GET /api/v1/calendar/next` |
+| `/uploaded <content_id> <platform> <url_optional>` | `POST /api/v1/content/{content_id}/uploaded` |
+| `/content_list <status_optional>` | `GET /api/v1/content-list?status=<status>` |
 | `/help` | Show the command list above |
 
 Hermes should send every string in the response `telegramMessages` array as a separate Telegram message, in order. For `/render`, if Hermes supports sending local files or private download links, it can also send each `files[].path` PNG after the text response. For `/video`, Hermes can send `file.path` as a video if the bot adapter and Telegram file size limits allow it; otherwise return the path or private download link.
@@ -521,6 +640,47 @@ Default local structure:
 
 The base directory is configured with `CONTENT_EXPORT_DIR`.
 
+## Workflow Data
+
+Workflow metadata is stored in each content JSON record:
+
+- `workflow.status`
+- `workflow.reviewStatus`
+- `workflow.reviewNotes`
+- `workflow.rejectionReason`
+- `workflow.approvedAt`
+- `workflow.approvedBy`
+- `workflow.scheduledDate`
+- `workflow.scheduledTime`
+- `workflow.scheduledPlatform`
+- `workflow.scheduledTimezone`
+- `workflow.uploadedAt`
+- `workflow.uploadedPlatform`
+- `workflow.uploadedUrl`
+- `workflow.renderStale`
+- `editHistory`
+
+Supported statuses:
+
+```text
+idea, generated, needs_review, reviewed, edit_requested, approved,
+png_rendered, video_rendered, voiceover_ready, scheduled, uploaded,
+archived, rejected
+```
+
+Supported platforms:
+
+```text
+instagram, tiktok, youtube_shorts, facebook_reels, linkedin, manual
+```
+
+Render staleness rules:
+
+- editing a slide marks PNG, video, and audio renders stale.
+- editing a caption does not mark media stale.
+- editing a voiceover script marks audio stale.
+- successful PNG, video, or audio rendering clears its corresponding stale flag.
+
 ## Template
 
 Current template:
@@ -601,6 +761,15 @@ The service handles:
 - Voiceover mixing failure.
 - Generated voiceover MP4 missing or zero-byte.
 - Duplicate audio mix requests return existing completed files unless `forceRegenerate` is `true`.
+- Slide number not found.
+- Empty edit text.
+- Invalid workflow status.
+- Invalid platform.
+- Invalid schedule date.
+- Scheduling rejected content.
+- Scheduling before approval when `CONTENT_REQUIRE_APPROVAL_BEFORE_SCHEDULE=true`.
+- Duplicate schedule.
+- Empty calendar results.
 
 ## Known Limitations
 
@@ -613,6 +782,9 @@ The service handles:
 - Telegram voice note download/session handling is not implemented in this service because Hermes code is not available; use `/mixvoice_file` or wire Hermes uploads to `/audio/mix`.
 - Background music is intentionally reserved for a future milestone.
 - Telegram video upload is not included here because the Hermes adapter was not available.
+- Auto-posting to social platforms is not implemented.
+- Calendar is a planning layer only; it does not trigger scheduled jobs.
+- No public dashboard is included.
 
 ## Manual Test Guide
 
@@ -742,12 +914,77 @@ or:
 - no voice cloning or impersonation was used.
 - existing commands still work.
 
+## Manual Workflow Test Guide
+
+1. Generate content:
+
+```text
+/hikmah kerja keras dan rezeki halal
+```
+
+2. Review content:
+
+```text
+/review <content_id>
+```
+
+3. Edit one slide:
+
+```text
+/edit_slide <content_id> 3 Rezeki bukan hanya soal banyak, tapi juga soal halal, tenang, dan berkah.
+```
+
+4. Check status:
+
+```text
+/status <content_id>
+```
+
+Expected: status should require review again, and media render flags should be stale or not started.
+
+5. Approve content:
+
+```text
+/approve <content_id>
+```
+
+6. Render assets:
+
+```text
+/render <content_id>
+/video <content_id>
+```
+
+7. Schedule content:
+
+```text
+/schedule <content_id> 2026-07-05 instagram
+```
+
+8. View calendar:
+
+```text
+/calendar week
+```
+
+9. Mark uploaded:
+
+```text
+/uploaded <content_id> instagram https://instagram.com/example
+```
+
+10. List uploaded:
+
+```text
+/content_list uploaded
+```
+
 ## Suggested Next Milestone
 
-Add content review/edit workflow, dashboard, content calendar, source/transcript manager, optional subtitle overlay, and user-provided background music support.
+Add source/transcript manager, AI highlight finder, clip sourcing workflow, topic bank, manual analytics input, posting checklist export, and a simple internal dashboard.
 
 ## Suggested Commit Message
 
 ```text
-feat(content): add voiceover audio mixing
+feat(content): add review workflow and content calendar
 ```

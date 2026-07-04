@@ -15,13 +15,18 @@ import secrets
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Optional
 from urllib import error as urlerror
+from urllib import parse as urlparse
 from urllib import request as urlrequest
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover - Python 3.8 fallback.
+    ZoneInfo = None  # type: ignore
 
 
 AI_BASE_URL = os.getenv("AI_BASE_URL", "http://127.0.0.1:20128/v1")
@@ -57,9 +62,30 @@ AUDIO_NORMALIZE_ENABLED = os.getenv("AUDIO_NORMALIZE_ENABLED", "true").lower() i
 AUDIO_DEFAULT_FIT_MODE = os.getenv("AUDIO_DEFAULT_FIT_MODE", "trim_or_pad")
 AUDIO_RENDER_TIMEOUT_SECONDS = float(os.getenv("AUDIO_RENDER_TIMEOUT_SECONDS", "180"))
 AUDIO_OUTPUT_CODEC = os.getenv("AUDIO_OUTPUT_CODEC", "aac")
+CONTENT_TIMEZONE = os.getenv("CONTENT_TIMEZONE", "Asia/Jakarta")
+CONTENT_DEFAULT_CALENDAR_DAYS = int(os.getenv("CONTENT_DEFAULT_CALENDAR_DAYS", "7"))
+CONTENT_ALLOW_SCHEDULE_REJECTED = os.getenv("CONTENT_ALLOW_SCHEDULE_REJECTED", "false").lower() in {"1", "true", "yes", "on"}
+CONTENT_REQUIRE_APPROVAL_BEFORE_SCHEDULE = os.getenv("CONTENT_REQUIRE_APPROVAL_BEFORE_SCHEDULE", "true").lower() in {"1", "true", "yes", "on"}
 TELEGRAM_LIMIT = int(os.getenv("TELEGRAM_MESSAGE_LIMIT", "3900"))
 SERVICE_DIR = Path(__file__).resolve().parent
 NODE_RENDERER = SERVICE_DIR / "render_png.js"
+VALID_WORKFLOW_STATUSES = {
+    "idea",
+    "generated",
+    "needs_review",
+    "reviewed",
+    "edit_requested",
+    "approved",
+    "png_rendered",
+    "video_rendered",
+    "voiceover_ready",
+    "scheduled",
+    "uploaded",
+    "archived",
+    "rejected",
+}
+SCHEDULABLE_STATUSES = {"approved", "png_rendered", "video_rendered", "voiceover_ready", "scheduled", "uploaded"}
+SUPPORTED_PLATFORMS = {"instagram", "tiktok", "youtube_shorts", "facebook_reels", "linkedin", "manual"}
 
 LOGGER = logging.getLogger("annotasi_carousel_studio")
 
@@ -86,6 +112,22 @@ def configure_logging() -> None:
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def local_today() -> date:
+    if ZoneInfo:
+        try:
+            return datetime.now(ZoneInfo(CONTENT_TIMEZONE)).date()
+        except Exception:
+            pass
+    return datetime.now().date()
+
+
+def parse_date(value: str, field_name: str = "date") -> date:
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise AppError(HTTPStatus.BAD_REQUEST, "invalid_schedule_date", f"{field_name} must use YYYY-MM-DD format.") from exc
 
 
 def content_id() -> str:
@@ -206,6 +248,22 @@ class JsonContentStore:
         if not isinstance(data, dict):
             raise AppError(HTTPStatus.INTERNAL_SERVER_ERROR, "storage_corrupt", "Stored content is invalid.")
         return data
+
+    def list_records(self) -> list[dict[str, Any]]:
+        try:
+            paths = list(self.root.glob("cnt_*.json"))
+        except OSError as exc:
+            raise AppError(HTTPStatus.INTERNAL_SERVER_ERROR, "storage_failure", "Could not list content.") from exc
+        records = []
+        for path in paths:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(data, dict):
+                records.append(data)
+        records.sort(key=lambda item: str(item.get("createdAt") or item.get("created_at") or ""), reverse=True)
+        return records
 
     def find_render(self, item_render_id: str) -> dict[str, Any]:
         if not re.fullmatch(r"rnd_\d{8}_[a-f0-9]{8}", item_render_id):
@@ -624,6 +682,259 @@ def format_voiceover_for_telegram(record: dict[str, Any]) -> list[str]:
     return split_telegram_message(text)
 
 
+def is_dakwah_content(record: dict[str, Any]) -> bool:
+    niche = str(record.get("niche") or record.get("content", {}).get("niche") or "").lower()
+    topic = str(record.get("topic") or "").lower()
+    return any(marker in f"{niche} {topic}" for marker in ["hikmah", "muslim", "dakwah", "annotasi_hikmah"])
+
+
+def review_checklist(record: dict[str, Any]) -> list[dict[str, Any]]:
+    if is_dakwah_content(record):
+        items = [
+            "Source/context checked",
+            "No invented Quran/hadith",
+            "No misleading attribution",
+            "No wrong context",
+            "Title not clickbait",
+            "Caption respectful",
+            "Visual appropriate",
+            "Voiceover own voice",
+            "Ready before upload",
+        ]
+    else:
+        items = [
+            "Hook is clear",
+            "Content is useful",
+            "No misleading claim",
+            "Caption is ready",
+            "CTA is appropriate",
+            "Format fits selected platform",
+        ]
+    checked = set(record.get("workflow", {}).get("checkedItems") or [])
+    return [{"label": item, "checked": item in checked} for item in items]
+
+
+def ensure_workflow(record: dict[str, Any]) -> dict[str, Any]:
+    workflow = record.get("workflow")
+    if not isinstance(workflow, dict):
+        workflow = {}
+        record["workflow"] = workflow
+    status = str(workflow.get("status") or record.get("status") or "generated")
+    if status not in VALID_WORKFLOW_STATUSES:
+        status = "generated"
+    workflow.setdefault("status", status)
+    workflow.setdefault("reviewStatus", "not_reviewed")
+    workflow.setdefault("reviewNotes", "")
+    workflow.setdefault("rejectionReason", "")
+    workflow.setdefault("approvedAt", "")
+    workflow.setdefault("approvedBy", "")
+    workflow.setdefault("scheduledDate", "")
+    workflow.setdefault("scheduledTime", "")
+    workflow.setdefault("scheduledPlatform", "")
+    workflow.setdefault("scheduledTimezone", CONTENT_TIMEZONE)
+    workflow.setdefault("uploadedAt", "")
+    workflow.setdefault("uploadedPlatform", "")
+    workflow.setdefault("uploadedUrl", "")
+    workflow.setdefault("lastEditedAt", "")
+    workflow.setdefault("renderStale", {"png": False, "video": False, "audio": False})
+    record["status"] = workflow["status"]
+    return workflow
+
+
+def set_workflow_status(record: dict[str, Any], status: str) -> None:
+    if status not in VALID_WORKFLOW_STATUSES:
+        raise AppError(HTTPStatus.BAD_REQUEST, "invalid_status", "Workflow status is invalid.")
+    workflow = ensure_workflow(record)
+    workflow["status"] = status
+    record["status"] = status
+    record["updatedAt"] = now_iso()
+
+
+def mark_render_stale(record: dict[str, Any], *, png: bool = False, video: bool = False, audio: bool = False) -> None:
+    workflow = ensure_workflow(record)
+    stale = workflow.get("renderStale")
+    if not isinstance(stale, dict):
+        stale = {"png": False, "video": False, "audio": False}
+        workflow["renderStale"] = stale
+    stale["png"] = bool(stale.get("png") or png)
+    stale["video"] = bool(stale.get("video") or video)
+    stale["audio"] = bool(stale.get("audio") or audio)
+    LOGGER.info("render_marked_stale content_id=%s png=%s video=%s audio=%s", record.get("id"), stale["png"], stale["video"], stale["audio"])
+
+
+def clear_render_stale(record: dict[str, Any], kind: str) -> None:
+    stale = ensure_workflow(record).get("renderStale")
+    if isinstance(stale, dict) and kind in stale:
+        stale[kind] = False
+
+
+def append_edit_history(record: dict[str, Any], field_name: str, old_value: Any, new_value: Any, edited_by: str = "internal") -> None:
+    history = record.get("editHistory")
+    if not isinstance(history, list):
+        history = []
+        record["editHistory"] = history
+    history.append(
+        {
+            "editId": f"edt_{datetime.now(timezone.utc).strftime('%Y%m%d')}_{secrets.token_hex(4)}",
+            "contentId": record.get("id"),
+            "fieldName": field_name,
+            "oldValue": old_value,
+            "newValue": new_value,
+            "editedAt": now_iso(),
+            "editedBy": edited_by,
+        }
+    )
+    ensure_workflow(record)["lastEditedAt"] = now_iso()
+
+
+def media_status(record: dict[str, Any], key: str, latest_key: str) -> str:
+    latest = record.get(latest_key)
+    stale = ensure_workflow(record).get("renderStale", {})
+    if isinstance(latest, dict) and latest.get("status") == "completed":
+        if isinstance(stale, dict) and stale.get(key):
+            return "stale"
+        return "completed"
+    return "not_started"
+
+
+def workflow_summary(record: dict[str, Any]) -> dict[str, Any]:
+    content = record.get("content") if isinstance(record.get("content"), dict) else {}
+    workflow = ensure_workflow(record)
+    return {
+        "id": record.get("id"),
+        "title": content.get("title", ""),
+        "topic": record.get("topic", ""),
+        "niche": record.get("niche", ""),
+        "status": workflow.get("status"),
+        "png": media_status(record, "png", "latestRender"),
+        "video": media_status(record, "video", "latestVideoRender"),
+        "voiceover": media_status(record, "audio", "latestAudioRender"),
+        "schedule": {
+            "date": workflow.get("scheduledDate", ""),
+            "time": workflow.get("scheduledTime", ""),
+            "platform": workflow.get("scheduledPlatform", ""),
+            "timezone": workflow.get("scheduledTimezone", CONTENT_TIMEZONE),
+        },
+        "uploaded": {
+            "at": workflow.get("uploadedAt", ""),
+            "platform": workflow.get("uploadedPlatform", ""),
+            "url": workflow.get("uploadedUrl", ""),
+        },
+        "renderStale": workflow.get("renderStale", {}),
+    }
+
+
+def format_review_for_telegram(record: dict[str, Any]) -> list[str]:
+    summary = workflow_summary(record)
+    checklist = review_checklist(record)
+    slides = record.get("content", {}).get("slides") if isinstance(record.get("content"), dict) else []
+    lines = [
+        "Review Content",
+        "",
+        "Content ID:",
+        str(summary["id"]),
+        "",
+        "Title:",
+        str(summary["title"]),
+        "",
+        "Status:",
+        str(summary["status"]),
+        "",
+        "Slides:",
+        f"{len(slides) if isinstance(slides, list) else 0} slides",
+        "",
+        "Checklist:",
+    ]
+    for item in checklist:
+        marker = "[x]" if item["checked"] else "[ ]"
+        lines.append(f"{marker} {item['label']}")
+    lines.extend(
+        [
+            "",
+            "Available actions:",
+            f"/approve {summary['id']}",
+            f"/reject {summary['id']} <reason>",
+            f"/edit_slide {summary['id']} 3 <new text>",
+            f"/edit_caption {summary['id']} <new caption>",
+            f"/status {summary['id']}",
+            "",
+            "Reminder:",
+            "Review kembali sebelum upload agar tidak salah konteks.",
+        ]
+    )
+    return split_telegram_message("\n".join(lines).strip())
+
+
+def format_status_for_telegram(record: dict[str, Any]) -> list[str]:
+    summary = workflow_summary(record)
+    schedule = summary["schedule"]
+    uploaded = summary["uploaded"]
+    schedule_text = "not scheduled"
+    if schedule["date"]:
+        schedule_text = f"{schedule['date']} {schedule['time'] or ''} {schedule['platform']}".strip()
+    uploaded_text = "no"
+    if uploaded["at"]:
+        uploaded_text = f"yes ({uploaded['platform']}) {uploaded['url']}".strip()
+    text = "\n".join(
+        [
+            "Content Status",
+            "",
+            "Content ID:",
+            str(summary["id"]),
+            "",
+            "Status:",
+            str(summary["status"]),
+            "",
+            "PNG:",
+            str(summary["png"]),
+            "",
+            "Video:",
+            str(summary["video"]),
+            "",
+            "Voiceover:",
+            str(summary["voiceover"]),
+            "",
+            "Schedule:",
+            schedule_text,
+            "",
+            "Uploaded:",
+            uploaded_text,
+        ]
+    )
+    return split_telegram_message(text)
+
+
+def format_calendar_for_telegram(items: list[dict[str, Any]], title: str, empty_message: str) -> list[str]:
+    if not items:
+        return [empty_message]
+    lines = [title, ""]
+    for index, record in enumerate(items, start=1):
+        summary = workflow_summary(record)
+        schedule = summary["schedule"]
+        lines.extend(
+            [
+                f"{index}. {summary['id']}",
+                f"Title: {summary['title']}",
+                f"Date: {schedule['date']}",
+                f"Platform: {schedule['platform']}",
+                f"Status: {summary['status']}",
+                "",
+            ]
+        )
+    return split_telegram_message("\n".join(lines).strip())
+
+
+def format_content_list_for_telegram(records: list[dict[str, Any]], status: str = "") -> list[str]:
+    lines = ["Content List", "", "Status:", status or "all", ""]
+    if not records:
+        lines.append("No content found.")
+        return split_telegram_message("\n".join(lines).strip())
+    for index, record in enumerate(records, start=1):
+        summary = workflow_summary(record)
+        lines.append(f"{index}. {summary['id']} - {summary['title']} ({summary['status']})")
+    return split_telegram_message("\n".join(lines).strip())
+
+
 def format_render_for_telegram(render: dict[str, Any]) -> list[str]:
     files = render.get("files") if isinstance(render.get("files"), list) else []
     lines = [
@@ -691,6 +1002,9 @@ def latest_completed_render(
     width: int,
     height: int,
 ) -> Optional[dict[str, Any]]:
+    stale = ensure_workflow(record).get("renderStale", {})
+    if isinstance(stale, dict) and stale.get("png"):
+        return None
     renders = record.get("renders")
     if not isinstance(renders, list):
         return None
@@ -815,6 +1129,9 @@ def latest_completed_audio_render(
     normalize_audio: bool,
     fit_mode: str,
 ) -> Optional[dict[str, Any]]:
+    stale = ensure_workflow(record).get("renderStale", {})
+    if isinstance(stale, dict) and stale.get("audio"):
+        return None
     audio_renders = record.get("audioRenders")
     if not isinstance(audio_renders, list):
         return None
@@ -865,6 +1182,9 @@ def latest_completed_video_render(
     duration_per_slide: float,
     transition_seconds: float,
 ) -> Optional[dict[str, Any]]:
+    stale = ensure_workflow(record).get("renderStale", {})
+    if isinstance(stale, dict) and stale.get("video"):
+        return None
     video_renders = record.get("videoRenders")
     if not isinstance(video_renders, list):
         return None
@@ -888,6 +1208,9 @@ def latest_completed_video_render(
 
 
 def latest_completed_png_render(record: dict[str, Any]) -> Optional[dict[str, Any]]:
+    stale = ensure_workflow(record).get("renderStale", {})
+    if isinstance(stale, dict) and stale.get("png"):
+        return None
     renders = record.get("renders")
     if not isinstance(renders, list):
         return None
@@ -1278,6 +1601,9 @@ def render_content_audio_mix(item_id: str, body: dict[str, Any]) -> dict[str, An
     audio_render["updatedAt"] = now_iso()
     write_audio_metadata(output_dir, audio_render)
     record["latestAudioRender"] = audio_render
+    clear_render_stale(record, "audio")
+    if ensure_workflow(record).get("status") not in {"scheduled", "uploaded", "archived", "rejected"}:
+        set_workflow_status(record, "voiceover_ready")
     record["updatedAt"] = now_iso()
     STORE.save(record)
     LOGGER.info("audio_metadata_stored content_id=%s audio_render_id=%s", item_id, item_audio_render_id)
@@ -1538,6 +1864,9 @@ def render_content_video(item_id: str, body: dict[str, Any]) -> dict[str, Any]:
     video_render["updatedAt"] = now_iso()
     write_video_metadata(output_dir, video_render)
     record["latestVideoRender"] = video_render
+    clear_render_stale(record, "video")
+    if ensure_workflow(record).get("status") not in {"scheduled", "uploaded", "archived", "rejected"}:
+        set_workflow_status(record, "video_rendered")
     record["updatedAt"] = now_iso()
     STORE.save(record)
     LOGGER.info("video_metadata_stored content_id=%s video_render_id=%s", item_id, item_video_render_id)
@@ -1688,10 +2017,280 @@ def render_content_png(item_id: str, body: dict[str, Any]) -> dict[str, Any]:
     render["files"] = files
     render["updatedAt"] = now_iso()
     record["latestRender"] = render
+    clear_render_stale(record, "png")
+    if ensure_workflow(record).get("status") not in {"scheduled", "uploaded", "archived", "rejected"}:
+        set_workflow_status(record, "png_rendered")
     record["updatedAt"] = now_iso()
     STORE.save(record)
     LOGGER.info("render_completed content_id=%s render_id=%s files=%d", item_id, item_render_id, len(files))
     return normalize_render_result(render)
+
+
+def get_review(item_id: str) -> dict[str, Any]:
+    LOGGER.info("review_requested content_id=%s", item_id)
+    record = STORE.get(item_id)
+    ensure_workflow(record)
+    return {
+        "contentId": item_id,
+        "summary": workflow_summary(record),
+        "checklist": review_checklist(record),
+        "telegramMessages": format_review_for_telegram(record),
+    }
+
+
+def get_content_status(item_id: str) -> dict[str, Any]:
+    record = STORE.get(item_id)
+    return {"contentId": item_id, "summary": workflow_summary(record), "telegramMessages": format_status_for_telegram(record)}
+
+
+def approve_content(item_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    record = STORE.get(item_id)
+    workflow = ensure_workflow(record)
+    if workflow.get("status") == "rejected":
+        raise AppError(HTTPStatus.CONFLICT, "cannot_approve_rejected", "Change status before approving rejected content.")
+    workflow["reviewStatus"] = "approved"
+    workflow["reviewNotes"] = str(body.get("notes") or "").strip()
+    workflow["approvedBy"] = str(body.get("reviewedBy") or "internal").strip()
+    workflow["approvedAt"] = now_iso()
+    set_workflow_status(record, "approved")
+    STORE.save(record)
+    LOGGER.info("content_approved content_id=%s", item_id)
+    text = "\n".join(
+        [
+            "Content approved.",
+            "",
+            "Content ID:",
+            item_id,
+            "",
+            "Next actions:",
+            f"/render {item_id}",
+            f"/video {item_id}",
+            f"/schedule {item_id} 2026-07-05 instagram",
+        ]
+    )
+    return {"contentId": item_id, "summary": workflow_summary(record), "telegramMessages": split_telegram_message(text)}
+
+
+def reject_content(item_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    reason = str(body.get("reason") or "").strip()
+    if not reason:
+        raise AppError(HTTPStatus.BAD_REQUEST, "missing_rejection_reason", "Rejection reason is required.")
+    record = STORE.get(item_id)
+    workflow = ensure_workflow(record)
+    workflow["reviewStatus"] = "rejected"
+    workflow["rejectionReason"] = reason
+    set_workflow_status(record, "rejected")
+    STORE.save(record)
+    LOGGER.info("content_rejected content_id=%s", item_id)
+    text = "\n".join(["Content rejected.", "", "Reason:", reason, "", "Status:", "rejected"])
+    return {"contentId": item_id, "summary": workflow_summary(record), "telegramMessages": split_telegram_message(text)}
+
+
+def update_content_status(item_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    status = str(body.get("status") or "").strip()
+    record = STORE.get(item_id)
+    set_workflow_status(record, status)
+    STORE.save(record)
+    return get_content_status(item_id)
+
+
+def edit_slide(item_id: str, slide_number: int, body: dict[str, Any]) -> dict[str, Any]:
+    new_text = str(body.get("text") or "").strip()
+    if not new_text:
+        raise AppError(HTTPStatus.BAD_REQUEST, "empty_edit_text", "Slide text cannot be empty.")
+    record = STORE.get(item_id)
+    slides = validate_renderable_content(record)
+    if not 1 <= slide_number <= len(slides):
+        raise AppError(HTTPStatus.NOT_FOUND, "slide_not_found", "Slide number was not found.")
+    slide = slides[slide_number - 1]
+    old_text = str(slide.get("text") or "")
+    slide["text"] = new_text
+    append_edit_history(record, f"slides.{slide_number}.text", old_text, new_text, str(body.get("editedBy") or "internal"))
+    mark_render_stale(record, png=True, video=True, audio=True)
+    set_workflow_status(record, "needs_review")
+    STORE.save(record)
+    LOGGER.info("slide_edited content_id=%s slide=%d", item_id, slide_number)
+    text = "\n".join(
+        [
+            "Slide updated.",
+            "",
+            "Content ID:",
+            item_id,
+            "",
+            "Slide:",
+            str(slide_number),
+            "",
+            "New text:",
+            new_text,
+            "",
+            "Status:",
+            "needs_review",
+            "",
+            "Reminder:",
+            "Render ulang PNG dan video setelah edit.",
+        ]
+    )
+    return {"contentId": item_id, "slideNumber": slide_number, "summary": workflow_summary(record), "telegramMessages": split_telegram_message(text)}
+
+
+def edit_caption(item_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    new_caption = str(body.get("caption") or "").strip()
+    if not new_caption:
+        raise AppError(HTTPStatus.BAD_REQUEST, "empty_edit_text", "Caption cannot be empty.")
+    record = STORE.get(item_id)
+    content = record.get("content")
+    if not isinstance(content, dict):
+        raise AppError(HTTPStatus.UNPROCESSABLE_ENTITY, "invalid_content", "Content package is invalid.")
+    old_caption = str(content.get("caption") or "")
+    content["caption"] = new_caption
+    append_edit_history(record, "caption", old_caption, new_caption, str(body.get("editedBy") or "internal"))
+    set_workflow_status(record, "needs_review")
+    STORE.save(record)
+    LOGGER.info("caption_edited content_id=%s", item_id)
+    return {"contentId": item_id, "summary": workflow_summary(record), "telegramMessages": split_telegram_message(f"Caption updated.\n\nContent ID:\n{item_id}\n\nStatus:\nneeds_review")}
+
+
+def edit_voiceover(item_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    new_script = str(body.get("voiceoverScript") or "").strip()
+    if not new_script:
+        raise AppError(HTTPStatus.BAD_REQUEST, "empty_edit_text", "Voiceover script cannot be empty.")
+    record = STORE.get(item_id)
+    content = record.get("content")
+    if not isinstance(content, dict):
+        raise AppError(HTTPStatus.UNPROCESSABLE_ENTITY, "invalid_content", "Content package is invalid.")
+    old_script = str(content.get("voiceoverScript") or "")
+    content["voiceoverScript"] = new_script
+    append_edit_history(record, "voiceoverScript", old_script, new_script, str(body.get("editedBy") or "internal"))
+    mark_render_stale(record, audio=True)
+    set_workflow_status(record, "needs_review")
+    STORE.save(record)
+    LOGGER.info("voiceover_edited content_id=%s", item_id)
+    return {"contentId": item_id, "summary": workflow_summary(record), "telegramMessages": split_telegram_message(f"Voiceover script updated.\n\nContent ID:\n{item_id}\n\nStatus:\nneeds_review")}
+
+
+def validate_platform(platform: str) -> str:
+    normalized = platform.strip().lower()
+    if normalized not in SUPPORTED_PLATFORMS:
+        raise AppError(HTTPStatus.BAD_REQUEST, "invalid_platform", "Platform is invalid.")
+    return normalized
+
+
+def schedule_content(item_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    platform = validate_platform(str(body.get("platform") or ""))
+    scheduled_date = parse_date(str(body.get("scheduledDate") or ""))
+    scheduled_time = str(body.get("scheduledTime") or "").strip()
+    tz = str(body.get("timezone") or CONTENT_TIMEZONE).strip()
+    record = STORE.get(item_id)
+    workflow = ensure_workflow(record)
+    if workflow.get("status") == "rejected" and not CONTENT_ALLOW_SCHEDULE_REJECTED:
+        raise AppError(HTTPStatus.CONFLICT, "cannot_schedule_rejected", "Rejected content cannot be scheduled.")
+    if CONTENT_REQUIRE_APPROVAL_BEFORE_SCHEDULE and workflow.get("status") not in SCHEDULABLE_STATUSES:
+        raise AppError(HTTPStatus.CONFLICT, "approval_required", "Approve content before scheduling.")
+    if workflow.get("scheduledDate") and workflow.get("scheduledPlatform"):
+        raise AppError(HTTPStatus.CONFLICT, "duplicate_schedule", "Content is already scheduled. Unschedule it first.")
+    workflow["scheduledDate"] = scheduled_date.isoformat()
+    workflow["scheduledTime"] = scheduled_time
+    workflow["scheduledPlatform"] = platform
+    workflow["scheduledTimezone"] = tz
+    set_workflow_status(record, "scheduled")
+    STORE.save(record)
+    LOGGER.info("content_scheduled content_id=%s date=%s platform=%s", item_id, scheduled_date.isoformat(), platform)
+    text = "\n".join(["Content scheduled.", "", "Content ID:", item_id, "", "Date:", scheduled_date.isoformat(), "", "Platform:", platform, "", "Status:", "scheduled"])
+    return {"contentId": item_id, "summary": workflow_summary(record), "telegramMessages": split_telegram_message(text)}
+
+
+def unschedule_content(item_id: str) -> dict[str, Any]:
+    record = STORE.get(item_id)
+    workflow = ensure_workflow(record)
+    workflow["scheduledDate"] = ""
+    workflow["scheduledTime"] = ""
+    workflow["scheduledPlatform"] = ""
+    if workflow.get("status") == "scheduled":
+        set_workflow_status(record, "approved")
+    else:
+        record["updatedAt"] = now_iso()
+    STORE.save(record)
+    LOGGER.info("content_unscheduled content_id=%s", item_id)
+    return {"contentId": item_id, "summary": workflow_summary(record), "telegramMessages": split_telegram_message(f"Content unscheduled.\n\nContent ID:\n{item_id}")}
+
+
+def mark_uploaded(item_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    platform = validate_platform(str(body.get("platform") or ""))
+    record = STORE.get(item_id)
+    workflow = ensure_workflow(record)
+    workflow["uploadedPlatform"] = platform
+    workflow["uploadedUrl"] = str(body.get("url") or "").strip()
+    workflow["uploadedAt"] = str(body.get("uploadedAt") or now_iso()).strip()
+    set_workflow_status(record, "uploaded")
+    STORE.save(record)
+    LOGGER.info("content_marked_uploaded content_id=%s platform=%s", item_id, platform)
+    text = "\n".join(["Content marked as uploaded.", "", "Content ID:", item_id, "", "Platform:", platform, "", "URL:", workflow["uploadedUrl"] or "-", "", "Status:", "uploaded"])
+    return {"contentId": item_id, "summary": workflow_summary(record), "telegramMessages": split_telegram_message(text)}
+
+
+def calendar_items(from_date: date, to_date: date, platform: str = "", status: str = "") -> list[dict[str, Any]]:
+    items = []
+    for record in STORE.list_records():
+        workflow = ensure_workflow(record)
+        scheduled = str(workflow.get("scheduledDate") or "")
+        if not scheduled:
+            continue
+        try:
+            item_date = date.fromisoformat(scheduled)
+        except ValueError:
+            continue
+        if item_date < from_date or item_date > to_date:
+            continue
+        if platform and workflow.get("scheduledPlatform") != platform:
+            continue
+        if status and workflow.get("status") != status:
+            continue
+        items.append(record)
+    items.sort(key=lambda item: (ensure_workflow(item).get("scheduledDate") or "", ensure_workflow(item).get("scheduledTime") or ""))
+    return items
+
+
+def query_calendar(params: dict[str, list[str]]) -> dict[str, Any]:
+    today = local_today()
+    from_value = params.get("from", [today.isoformat()])[0]
+    to_value = params.get("to", [(today + timedelta(days=CONTENT_DEFAULT_CALENDAR_DAYS - 1)).isoformat()])[0]
+    from_date = parse_date(from_value, "from")
+    to_date = parse_date(to_value, "to")
+    if to_date < from_date:
+        raise AppError(HTTPStatus.BAD_REQUEST, "invalid_date_range", "Calendar to date must be after from date.")
+    platform = params.get("platform", [""])[0].strip().lower()
+    if platform:
+        platform = validate_platform(platform)
+    status = params.get("status", [""])[0].strip()
+    if status and status not in VALID_WORKFLOW_STATUSES:
+        raise AppError(HTTPStatus.BAD_REQUEST, "invalid_status", "Workflow status is invalid.")
+    LOGGER.info("calendar_requested from=%s to=%s", from_date.isoformat(), to_date.isoformat())
+    items = calendar_items(from_date, to_date, platform, status)
+    title = f"Content Calendar\n\n{from_date.isoformat()} to {to_date.isoformat()}"
+    return {
+        "from": from_date.isoformat(),
+        "to": to_date.isoformat(),
+        "items": [workflow_summary(item) for item in items],
+        "telegramMessages": format_calendar_for_telegram(items, title, "Calendar has no scheduled content."),
+    }
+
+
+def list_content_by_status(status: str = "", limit: int = 20) -> dict[str, Any]:
+    if status and status not in VALID_WORKFLOW_STATUSES:
+        raise AppError(HTTPStatus.BAD_REQUEST, "invalid_status", "Workflow status is invalid.")
+    records = []
+    for record in STORE.list_records():
+        workflow = ensure_workflow(record)
+        if status and workflow.get("status") != status:
+            continue
+        records.append(record)
+        if len(records) >= limit:
+            break
+    return {
+        "status": status or "all",
+        "items": [workflow_summary(record) for record in records],
+        "telegramMessages": format_content_list_for_telegram(records, status),
+    }
 
 
 def generate_content(body: dict[str, Any], default_niche: str) -> dict[str, Any]:
@@ -1740,6 +2339,7 @@ def generate_content(body: dict[str, Any], default_niche: str) -> dict[str, Any]
         "createdAt": now_iso(),
         "updatedAt": now_iso(),
     }
+    ensure_workflow(record)
     STORE.save(record)
     messages = format_full_for_telegram(record, include_voiceover=False)
     LOGGER.info("response_prepared content_id=%s telegram_messages=%d", item_id, len(messages))
@@ -1797,10 +2397,86 @@ class AnnotasiHandler(BaseHTTPRequestHandler):
                 {"error": {"code": "internal_error", "message": "Unexpected server error."}},
             )
 
+    def do_PATCH(self) -> None:
+        try:
+            self.handle_patch()
+        except AppError as exc:
+            LOGGER.warning("request_failed code=%s message=%s", exc.code, exc.message)
+            json_response(self, exc.status, {"error": {"code": exc.code, "message": exc.message}})
+        except Exception:
+            LOGGER.exception("unhandled_error")
+            json_response(
+                self,
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {"error": {"code": "internal_error", "message": "Unexpected server error."}},
+            )
+
+    def do_DELETE(self) -> None:
+        try:
+            self.handle_delete()
+        except AppError as exc:
+            LOGGER.warning("request_failed code=%s message=%s", exc.code, exc.message)
+            json_response(self, exc.status, {"error": {"code": exc.code, "message": exc.message}})
+        except Exception:
+            LOGGER.exception("unhandled_error")
+            json_response(
+                self,
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {"error": {"code": "internal_error", "message": "Unexpected server error."}},
+            )
+
     def handle_get(self) -> None:
-        path = self.path.split("?", 1)[0].rstrip("/")
+        parsed_url = urlparse.urlparse(self.path)
+        path = parsed_url.path.rstrip("/")
+        params = urlparse.parse_qs(parsed_url.query)
         if path == "/health":
             json_response(self, HTTPStatus.OK, {"status": "ok", "service": "annotasi-carousel-studio"})
+            return
+
+        if path == "/api/v1/calendar":
+            json_response(self, HTTPStatus.OK, query_calendar(params))
+            return
+
+        calendar_shortcut_match = re.fullmatch(r"/api/v1/calendar/(today|week|month|next)", path)
+        if calendar_shortcut_match:
+            mode = calendar_shortcut_match.group(1)
+            today = local_today()
+            if mode == "today":
+                query = {"from": [today.isoformat()], "to": [today.isoformat()]}
+                body = query_calendar(query)
+                body["telegramMessages"] = format_calendar_for_telegram(
+                    [STORE.get(str(item["id"])) for item in body["items"]],
+                    f"Today's Content Plan\n\n{today.isoformat()}",
+                    "No content scheduled for today.",
+                )
+                json_response(self, HTTPStatus.OK, body)
+                return
+            if mode == "week":
+                json_response(self, HTTPStatus.OK, query_calendar({"from": [today.isoformat()], "to": [(today + timedelta(days=6)).isoformat()]}))
+                return
+            if mode == "month":
+                month_start = today.replace(day=1)
+                next_month = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1)
+                month_end = next_month - timedelta(days=1)
+                json_response(self, HTTPStatus.OK, query_calendar({"from": [month_start.isoformat()], "to": [month_end.isoformat()]}))
+                return
+            items = calendar_items(today, today + timedelta(days=365))
+            next_item = items[:1]
+            json_response(
+                self,
+                HTTPStatus.OK,
+                {
+                    "items": [workflow_summary(item) for item in next_item],
+                    "telegramMessages": format_calendar_for_telegram(next_item, "Next Scheduled Content", "No scheduled content found."),
+                },
+            )
+            return
+
+        if path == "/api/v1/content-list":
+            status = params.get("status", [""])[0].strip()
+            limit = parse_int(params.get("limit", ["20"])[0], 20, "limit")
+            limit = max(1, min(limit, 100))
+            json_response(self, HTTPStatus.OK, list_content_by_status(status, limit))
             return
 
         render_match = re.fullmatch(r"/api/v1/render/(rnd_\d{8}_[a-f0-9]{8})", path)
@@ -1848,6 +2524,16 @@ class AnnotasiHandler(BaseHTTPRequestHandler):
             json_response(self, HTTPStatus.OK, normalize_render_result(render))
             return
 
+        review_match = re.fullmatch(r"/api/v1/content/(cnt_\d{8}_[a-f0-9]{8})/review", path)
+        if review_match:
+            json_response(self, HTTPStatus.OK, get_review(review_match.group(1)))
+            return
+
+        status_match = re.fullmatch(r"/api/v1/content/(cnt_\d{8}_[a-f0-9]{8})/status", path)
+        if status_match:
+            json_response(self, HTTPStatus.OK, get_content_status(status_match.group(1)))
+            return
+
         match = re.fullmatch(r"/api/v1/content/(cnt_\d{8}_[a-f0-9]{8})(?:/(caption|voiceover|voiceover-script))?", path)
         if not match:
             raise AppError(HTTPStatus.NOT_FOUND, "not_found", "Route not found.")
@@ -1872,8 +2558,24 @@ class AnnotasiHandler(BaseHTTPRequestHandler):
         json_response(self, HTTPStatus.OK, body)
 
     def handle_post(self) -> None:
-        path = self.path.split("?", 1)[0].rstrip("/")
+        path = urlparse.urlparse(self.path).path.rstrip("/")
         body = read_json_body(self)
+        approve_match = re.fullmatch(r"/api/v1/content/(cnt_\d{8}_[a-f0-9]{8})/approve", path)
+        if approve_match:
+            json_response(self, HTTPStatus.OK, approve_content(approve_match.group(1), body))
+            return
+        reject_match = re.fullmatch(r"/api/v1/content/(cnt_\d{8}_[a-f0-9]{8})/reject", path)
+        if reject_match:
+            json_response(self, HTTPStatus.OK, reject_content(reject_match.group(1), body))
+            return
+        schedule_match = re.fullmatch(r"/api/v1/content/(cnt_\d{8}_[a-f0-9]{8})/schedule", path)
+        if schedule_match:
+            json_response(self, HTTPStatus.OK, schedule_content(schedule_match.group(1), body))
+            return
+        uploaded_match = re.fullmatch(r"/api/v1/content/(cnt_\d{8}_[a-f0-9]{8})/uploaded", path)
+        if uploaded_match:
+            json_response(self, HTTPStatus.OK, mark_uploaded(uploaded_match.group(1), body))
+            return
         audio_prepare_match = re.fullmatch(r"/api/v1/content/(cnt_\d{8}_[a-f0-9]{8})/audio/prepare", path)
         if audio_prepare_match:
             json_response(self, HTTPStatus.OK, prepare_audio_session(audio_prepare_match.group(1)))
@@ -1900,6 +2602,35 @@ class AnnotasiHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/v1/content/ideas":
             json_response(self, HTTPStatus.OK, generate_ideas(body))
+            return
+        raise AppError(HTTPStatus.NOT_FOUND, "not_found", "Route not found.")
+
+    def handle_patch(self) -> None:
+        path = urlparse.urlparse(self.path).path.rstrip("/")
+        body = read_json_body(self)
+        slide_match = re.fullmatch(r"/api/v1/content/(cnt_\d{8}_[a-f0-9]{8})/slides/(\d+)", path)
+        if slide_match:
+            json_response(self, HTTPStatus.OK, edit_slide(slide_match.group(1), int(slide_match.group(2)), body))
+            return
+        caption_match = re.fullmatch(r"/api/v1/content/(cnt_\d{8}_[a-f0-9]{8})/caption", path)
+        if caption_match:
+            json_response(self, HTTPStatus.OK, edit_caption(caption_match.group(1), body))
+            return
+        voiceover_match = re.fullmatch(r"/api/v1/content/(cnt_\d{8}_[a-f0-9]{8})/voiceover", path)
+        if voiceover_match:
+            json_response(self, HTTPStatus.OK, edit_voiceover(voiceover_match.group(1), body))
+            return
+        status_match = re.fullmatch(r"/api/v1/content/(cnt_\d{8}_[a-f0-9]{8})/status", path)
+        if status_match:
+            json_response(self, HTTPStatus.OK, update_content_status(status_match.group(1), body))
+            return
+        raise AppError(HTTPStatus.NOT_FOUND, "not_found", "Route not found.")
+
+    def handle_delete(self) -> None:
+        path = urlparse.urlparse(self.path).path.rstrip("/")
+        schedule_match = re.fullmatch(r"/api/v1/content/(cnt_\d{8}_[a-f0-9]{8})/schedule", path)
+        if schedule_match:
+            json_response(self, HTTPStatus.OK, unschedule_content(schedule_match.group(1)))
             return
         raise AppError(HTTPStatus.NOT_FOUND, "not_found", "Route not found.")
 
