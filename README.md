@@ -17,6 +17,7 @@ This is intentionally a small HTTP service instead of a Hermes patch because the
 - Converts completed PNG carousel renders into 1080x1920 vertical MP4 videos for Shorts/Reels/TikTok.
 - Mixes a user-provided voiceover audio file into the latest completed MP4 video.
 - Adds review/edit workflow status, render staleness, upload markers, and a simple content calendar.
+- Tracks source materials, transcripts, transcript segments, permissions, credits, and source-content links.
 
 ## Files
 
@@ -71,6 +72,14 @@ CONTENT_TIMEZONE=Asia/Jakarta
 CONTENT_DEFAULT_CALENDAR_DAYS=7
 CONTENT_ALLOW_SCHEDULE_REJECTED=false
 CONTENT_REQUIRE_APPROVAL_BEFORE_SCHEDULE=true
+SOURCE_STORAGE_DIR=./data/sources
+SOURCE_REQUIRE_APPROVAL_FOR_GENERATION=false
+SOURCE_BLOCK_RESTRICTED_GENERATION=true
+TRANSCRIPT_MAX_CHARS_DIRECT=12000
+TRANSCRIPT_SEGMENT_MIN_WORDS=300
+TRANSCRIPT_SEGMENT_MAX_WORDS=800
+SOURCE_DEFAULT_LANGUAGE=id
+SOURCE_DEFAULT_PERMISSION_STATUS=unknown
 ```
 
 The service logs whether an API key is configured, but never logs the key value.
@@ -370,6 +379,74 @@ curl -s http://127.0.0.1:8097/api/v1/content-list
 curl -s 'http://127.0.0.1:8097/api/v1/content-list?status=needs_review'
 ```
 
+### Source Manager
+
+```sh
+curl -s http://127.0.0.1:8097/api/v1/sources \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "title": "Kajian Rezeki Halal",
+    "speakerName": "Ustadz Example",
+    "sourceUrl": "https://youtube.com/example",
+    "platform": "youtube",
+    "sourceType": "youtube_video",
+    "permissionStatus": "allowed_with_credit",
+    "topic": "rezeki halal"
+  }'
+```
+
+```sh
+curl -s http://127.0.0.1:8097/api/v1/sources
+curl -s http://127.0.0.1:8097/api/v1/sources/src_20260704_ab12cd34
+curl -s http://127.0.0.1:8097/api/v1/sources/src_20260704_ab12cd34/review
+```
+
+Approve, restrict, or set credit:
+
+```sh
+curl -s -X POST http://127.0.0.1:8097/api/v1/sources/src_20260704_ab12cd34/approve
+curl -s http://127.0.0.1:8097/api/v1/sources/src_20260704_ab12cd34/restrict \
+  -H 'Content-Type: application/json' \
+  -d '{"reason":"permission unclear"}'
+curl -s http://127.0.0.1:8097/api/v1/sources/src_20260704_ab12cd34/credit \
+  -H 'Content-Type: application/json' \
+  -d '{"creditText":"Sumber: Kajian Rezeki Halal - Ustadz Example"}'
+```
+
+### Transcript Manager
+
+```sh
+curl -s http://127.0.0.1:8097/api/v1/sources/src_20260704_ab12cd34/transcript \
+  -H 'Content-Type: application/json' \
+  -d '{"transcriptText":"Bismillah... hari ini kita membahas rezeki halal..."}'
+```
+
+```sh
+curl -s http://127.0.0.1:8097/api/v1/sources/src_20260704_ab12cd34/transcript
+curl -s -X POST http://127.0.0.1:8097/api/v1/sources/src_20260704_ab12cd34/segments/generate
+curl -s http://127.0.0.1:8097/api/v1/sources/src_20260704_ab12cd34/segments
+curl -s http://127.0.0.1:8097/api/v1/segments/seg_20260704_ab12cd34
+```
+
+Update segment risk or notes:
+
+```sh
+curl -s -X PATCH http://127.0.0.1:8097/api/v1/segments/seg_20260704_ab12cd34 \
+  -H 'Content-Type: application/json' \
+  -d '{"riskLevel":"medium","contextNotes":"Jangan dipotong tanpa konteks tentang ikhtiar."}'
+```
+
+Generate source-based ideas or content:
+
+```sh
+curl -s -X POST http://127.0.0.1:8097/api/v1/sources/src_20260704_ab12cd34/ideas
+curl -s http://127.0.0.1:8097/api/v1/sources/src_20260704_ab12cd34/generate-content \
+  -H 'Content-Type: application/json' \
+  -d '{"topic":"rezeki halal untuk pekerja"}'
+curl -s -X POST http://127.0.0.1:8097/api/v1/segments/seg_20260704_ab12cd34/generate-content
+curl -s http://127.0.0.1:8097/api/v1/content/cnt_20260704_ab12cd34/source
+```
+
 ## Hermes Integration
 
 Recommended Telegram command mapping:
@@ -409,6 +486,24 @@ Recommended Telegram command mapping:
 | `/next` | `GET /api/v1/calendar/next` |
 | `/uploaded <content_id> <platform> <url_optional>` | `POST /api/v1/content/{content_id}/uploaded` |
 | `/content_list <status_optional>` | `GET /api/v1/content-list?status=<status>` |
+| `/source_add ...` | `POST /api/v1/sources` |
+| `/source_list` | `GET /api/v1/sources` |
+| `/source <source_id>` | `GET /api/v1/sources/{source_id}` |
+| `/source_review <source_id>` | `GET /api/v1/sources/{source_id}/review` |
+| `/source_approve <source_id>` | `POST /api/v1/sources/{source_id}/approve` |
+| `/source_restrict <source_id> <reason>` | `POST /api/v1/sources/{source_id}/restrict` |
+| `/source_credit <source_id> <credit_text>` | `POST /api/v1/sources/{source_id}/credit` |
+| `/transcript_add <source_id> <text>` | `POST /api/v1/sources/{source_id}/transcript` |
+| `/transcript <source_id>` | `GET /api/v1/sources/{source_id}/transcript` |
+| `/segments_generate <source_id>` | `POST /api/v1/sources/{source_id}/segments/generate` |
+| `/segments <source_id>` | `GET /api/v1/sources/{source_id}/segments` |
+| `/segment <segment_id>` | `GET /api/v1/segments/{segment_id}` |
+| `/segment_risk <segment_id> <risk>` | `PATCH /api/v1/segments/{segment_id}` |
+| `/segment_notes <segment_id> <notes>` | `PATCH /api/v1/segments/{segment_id}` |
+| `/ideas_from_source <source_id>` | `POST /api/v1/sources/{source_id}/ideas` |
+| `/from_source <source_id> <topic_optional>` | `POST /api/v1/sources/{source_id}/generate-content` |
+| `/from_segment <segment_id>` | `POST /api/v1/segments/{segment_id}/generate-content` |
+| `/source_for_content <content_id>` | `GET /api/v1/content/{content_id}/source` |
 | `/help` | Show the command list above |
 
 Hermes should send every string in the response `telegramMessages` array as a separate Telegram message, in order. For `/render`, if Hermes supports sending local files or private download links, it can also send each `files[].path` PNG after the text response. For `/video`, Hermes can send `file.path` as a video if the bot adapter and Telegram file size limits allow it; otherwise return the path or private download link.
@@ -636,9 +731,11 @@ Default local structure:
 ./data/exports/{content_id}/{audio_render_id}/voiceover-normalized.wav
 ./data/exports/{content_id}/{audio_render_id}/final-voiceover.mp4
 ./data/exports/{content_id}/{audio_render_id}/audio-render-metadata.json
+./data/sources/{source_id}.json
 ```
 
 The base directory is configured with `CONTENT_EXPORT_DIR`.
+Source records are stored under `SOURCE_STORAGE_DIR`.
 
 ## Workflow Data
 
@@ -680,6 +777,88 @@ Render staleness rules:
 - editing a caption does not mark media stale.
 - editing a voiceover script marks audio stale.
 - successful PNG, video, or audio rendering clears its corresponding stale flag.
+
+## Source Data
+
+Source records are stored as JSON files with:
+
+- `sourceId`
+- `title`
+- `speakerName`
+- `sourceType`
+- `platform`
+- `sourceUrl`
+- `localFilePath`
+- `permissionStatus`
+- `permissionNotes`
+- `creditText`
+- `topic`
+- `category`
+- `language`
+- `durationSeconds`
+- `sourceStatus`
+- `contextNotes`
+- `transcript`
+- `generatedContent`
+
+Supported source types:
+
+```text
+youtube_video, instagram_video, tiktok_video, podcast, webinar,
+user_uploaded_video, manual_note, article, book, other
+```
+
+Supported source platforms:
+
+```text
+youtube, instagram, tiktok, spotify, website, local_file, manual, other
+```
+
+Supported permission statuses:
+
+```text
+unknown, allowed_for_dakwah, allowed_with_credit, own_content,
+needs_permission, restricted, rejected
+```
+
+Permission rules:
+
+- restricted or rejected sources are blocked from generation by default.
+- unapproved sources are allowed for internal MVP generation when `SOURCE_REQUIRE_APPROVAL_FOR_GENERATION=false`, but responses include warnings.
+- `allowed_for_dakwah` does not mean automatically safe for monetization.
+- source credit is carried into generated content as `sourceCreditSuggestion` and `sourceLink.sourceCreditUsed`.
+
+## Transcript Data
+
+Each source can have one transcript object with:
+
+- `transcriptId`
+- `sourceId`
+- `transcriptText`
+- `language`
+- `transcriptStatus`
+- `segments`
+
+Segments include:
+
+- `segmentId`
+- `transcriptId`
+- `sourceId`
+- `startTimeSeconds`
+- `endTimeSeconds`
+- `text`
+- `topic`
+- `contextNotes`
+- `riskLevel`
+
+Segmentation rules:
+
+- timestamped lines such as `[00:01:20] text` keep their timestamp.
+- ranges such as `00:01:20 - 00:02:10 text` keep start and end times.
+- if no timestamps exist, segments are split by paragraphs/logical chunks.
+- exact timestamps are not invented.
+- untimestamped segments receive context note: `Timestamp tidak tersedia. Segment dibuat berdasarkan struktur teks.`
+- risk level is a heuristic default and should be manually reviewed.
 
 ## Template
 
@@ -770,6 +949,14 @@ The service handles:
 - Scheduling before approval when `CONTENT_REQUIRE_APPROVAL_BEFORE_SCHEDULE=true`.
 - Duplicate schedule.
 - Empty calendar results.
+- Invalid source ID or segment ID.
+- Source not found.
+- Transcript not found.
+- Transcript too long for direct input.
+- Invalid source type, platform, permission status, or risk level.
+- Restricted source generation blocked.
+- Source-based generation without transcript.
+- AI source ideas/content JSON validation failure.
 
 ## Known Limitations
 
@@ -785,6 +972,9 @@ The service handles:
 - Auto-posting to social platforms is not implemented.
 - Calendar is a planning layer only; it does not trigger scheduled jobs.
 - No public dashboard is included.
+- Transcript paste sessions are not implemented in this service; use direct `/transcript_add` or wire Hermes state to the transcript endpoint.
+- Source segmentation is heuristic and should be reviewed manually.
+- Source-based idea/content generation uses transcript excerpts, not full long-document retrieval.
 
 ## Manual Test Guide
 
@@ -979,12 +1169,75 @@ Expected: status should require review again, and media render flags should be s
 /content_list uploaded
 ```
 
+## Manual Source Test Guide
+
+1. Add source:
+
+```text
+/source_add Kajian Rezeki Halal | Ustadz Example | https://youtube.com/example | youtube | allowed_with_credit
+```
+
+2. Check source:
+
+```text
+/source <source_id>
+```
+
+3. Add credit:
+
+```text
+/source_credit <source_id> Sumber: Kajian Rezeki Halal - Ustadz Example
+```
+
+4. Review and approve source:
+
+```text
+/source_review <source_id>
+/source_approve <source_id>
+```
+
+5. Add transcript:
+
+```text
+/transcript_add <source_id> <paste transcript text>
+```
+
+6. Generate and inspect segments:
+
+```text
+/segments_generate <source_id>
+/segments <source_id>
+/segment <segment_id>
+```
+
+7. Add segment context:
+
+```text
+/segment_notes <segment_id> Jangan dipotong tanpa konteks tentang ikhtiar sebelum tawakal.
+```
+
+8. Generate ideas and content:
+
+```text
+/ideas_from_source <source_id>
+/from_source <source_id> rezeki halal untuk pekerja
+```
+
+9. Check linked source and review:
+
+```text
+/source_for_content <content_id>
+/review <content_id>
+```
+
+Expected: source, credit, permission, segment, and risk context appear in the review output.
+
 ## Suggested Next Milestone
 
-Add source/transcript manager, AI highlight finder, clip sourcing workflow, topic bank, manual analytics input, posting checklist export, and a simple internal dashboard.
+Add AI highlight finder, clip candidate generation, timestamp-based clip planning, manual clip selection, local source video clipping, subtitle overlay, and clip package export.
 
 ## Suggested Commit Message
 
 ```text
-feat(content): add review workflow and content calendar
+feat(content): add source and transcript management
 ```

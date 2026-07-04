@@ -36,6 +36,7 @@ AI_TIMEOUT_SECONDS = float(os.getenv("AI_TIMEOUT_SECONDS", "90"))
 HOST = os.getenv("ANNOTASI_HOST", "127.0.0.1")
 PORT = int(os.getenv("ANNOTASI_PORT", "8097"))
 STORAGE_DIR = Path(os.getenv("CONTENT_STORAGE_DIR", "./data/content"))
+SOURCE_STORAGE_DIR = Path(os.getenv("SOURCE_STORAGE_DIR", "./data/sources"))
 EXPORT_DIR = Path(os.getenv("CONTENT_EXPORT_DIR", "./data/exports"))
 DEFAULT_TEMPLATE = os.getenv("CAROUSEL_DEFAULT_TEMPLATE", "annotasi_hikmah_dark")
 CAROUSEL_WIDTH = int(os.getenv("CAROUSEL_WIDTH", "1080"))
@@ -66,6 +67,13 @@ CONTENT_TIMEZONE = os.getenv("CONTENT_TIMEZONE", "Asia/Jakarta")
 CONTENT_DEFAULT_CALENDAR_DAYS = int(os.getenv("CONTENT_DEFAULT_CALENDAR_DAYS", "7"))
 CONTENT_ALLOW_SCHEDULE_REJECTED = os.getenv("CONTENT_ALLOW_SCHEDULE_REJECTED", "false").lower() in {"1", "true", "yes", "on"}
 CONTENT_REQUIRE_APPROVAL_BEFORE_SCHEDULE = os.getenv("CONTENT_REQUIRE_APPROVAL_BEFORE_SCHEDULE", "true").lower() in {"1", "true", "yes", "on"}
+SOURCE_REQUIRE_APPROVAL_FOR_GENERATION = os.getenv("SOURCE_REQUIRE_APPROVAL_FOR_GENERATION", "false").lower() in {"1", "true", "yes", "on"}
+SOURCE_BLOCK_RESTRICTED_GENERATION = os.getenv("SOURCE_BLOCK_RESTRICTED_GENERATION", "true").lower() in {"1", "true", "yes", "on"}
+TRANSCRIPT_MAX_CHARS_DIRECT = int(os.getenv("TRANSCRIPT_MAX_CHARS_DIRECT", "12000"))
+TRANSCRIPT_SEGMENT_MIN_WORDS = int(os.getenv("TRANSCRIPT_SEGMENT_MIN_WORDS", "300"))
+TRANSCRIPT_SEGMENT_MAX_WORDS = int(os.getenv("TRANSCRIPT_SEGMENT_MAX_WORDS", "800"))
+SOURCE_DEFAULT_LANGUAGE = os.getenv("SOURCE_DEFAULT_LANGUAGE", "id")
+SOURCE_DEFAULT_PERMISSION_STATUS = os.getenv("SOURCE_DEFAULT_PERMISSION_STATUS", "unknown")
 TELEGRAM_LIMIT = int(os.getenv("TELEGRAM_MESSAGE_LIMIT", "3900"))
 SERVICE_DIR = Path(__file__).resolve().parent
 NODE_RENDERER = SERVICE_DIR / "render_png.js"
@@ -86,6 +94,31 @@ VALID_WORKFLOW_STATUSES = {
 }
 SCHEDULABLE_STATUSES = {"approved", "png_rendered", "video_rendered", "voiceover_ready", "scheduled", "uploaded"}
 SUPPORTED_PLATFORMS = {"instagram", "tiktok", "youtube_shorts", "facebook_reels", "linkedin", "manual"}
+SUPPORTED_SOURCE_TYPES = {
+    "youtube_video",
+    "instagram_video",
+    "tiktok_video",
+    "podcast",
+    "webinar",
+    "user_uploaded_video",
+    "manual_note",
+    "article",
+    "book",
+    "other",
+}
+SUPPORTED_SOURCE_PLATFORMS = {"youtube", "instagram", "tiktok", "spotify", "website", "local_file", "manual", "other"}
+SUPPORTED_PERMISSION_STATUSES = {
+    "unknown",
+    "allowed_for_dakwah",
+    "allowed_with_credit",
+    "own_content",
+    "needs_permission",
+    "restricted",
+    "rejected",
+}
+SUPPORTED_SOURCE_STATUSES = {"draft", "needs_review", "approved", "restricted", "archived"}
+SUPPORTED_TRANSCRIPT_STATUSES = {"available", "draft", "archived"}
+SUPPORTED_RISK_LEVELS = {"low", "medium", "high"}
 
 LOGGER = logging.getLogger("annotasi_carousel_studio")
 
@@ -148,6 +181,21 @@ def video_render_id() -> str:
 def audio_render_id() -> str:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
     return f"aud_{stamp}_{secrets.token_hex(4)}"
+
+
+def source_id() -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+    return f"src_{stamp}_{secrets.token_hex(4)}"
+
+
+def transcript_id() -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+    return f"tr_{stamp}_{secrets.token_hex(4)}"
+
+
+def segment_id() -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+    return f"seg_{stamp}_{secrets.token_hex(4)}"
 
 
 def word_count(text: str) -> int:
@@ -326,7 +374,74 @@ class JsonContentStore:
         raise AppError(HTTPStatus.NOT_FOUND, "audio_render_not_found", "Audio render metadata was not found.")
 
 
+class JsonSourceStore:
+    def __init__(self, root: Path):
+        self.root = root
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    def path_for(self, item_id: str) -> Path:
+        if not re.fullmatch(r"src_\d{8}_[a-f0-9]{8}", item_id):
+            raise AppError(HTTPStatus.BAD_REQUEST, "invalid_source_id", "Source ID format is invalid.")
+        return self.root / f"{item_id}.json"
+
+    def save(self, record: dict[str, Any]) -> None:
+        path = self.path_for(record["sourceId"])
+        tmp = path.with_suffix(".tmp")
+        try:
+            tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(path)
+        except OSError as exc:
+            raise AppError(HTTPStatus.INTERNAL_SERVER_ERROR, "storage_failure", "Could not save source.") from exc
+        LOGGER.info("source_saved source_id=%s", record["sourceId"])
+
+    def get(self, item_id: str) -> dict[str, Any]:
+        path = self.path_for(item_id)
+        if not path.exists():
+            raise AppError(HTTPStatus.NOT_FOUND, "source_not_found", "Source was not found.")
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise AppError(HTTPStatus.INTERNAL_SERVER_ERROR, "storage_failure", "Could not read source.") from exc
+        except json.JSONDecodeError as exc:
+            raise AppError(HTTPStatus.INTERNAL_SERVER_ERROR, "storage_corrupt", "Stored source is invalid.") from exc
+        if not isinstance(data, dict):
+            raise AppError(HTTPStatus.INTERNAL_SERVER_ERROR, "storage_corrupt", "Stored source is invalid.")
+        return data
+
+    def list_records(self) -> list[dict[str, Any]]:
+        try:
+            paths = list(self.root.glob("src_*.json"))
+        except OSError as exc:
+            raise AppError(HTTPStatus.INTERNAL_SERVER_ERROR, "storage_failure", "Could not list sources.") from exc
+        records = []
+        for path in paths:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(data, dict):
+                records.append(data)
+        records.sort(key=lambda item: str(item.get("createdAt") or ""), reverse=True)
+        return records
+
+    def find_segment(self, item_segment_id: str) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        if not re.fullmatch(r"seg_\d{8}_[a-f0-9]{8}", item_segment_id):
+            raise AppError(HTTPStatus.BAD_REQUEST, "invalid_segment_id", "Segment ID format is invalid.")
+        for source in self.list_records():
+            transcript = source.get("transcript")
+            if not isinstance(transcript, dict):
+                continue
+            segments = transcript.get("segments")
+            if not isinstance(segments, list):
+                continue
+            for segment in segments:
+                if isinstance(segment, dict) and segment.get("segmentId") == item_segment_id:
+                    return source, transcript, segment
+        raise AppError(HTTPStatus.NOT_FOUND, "segment_not_found", "Segment was not found.")
+
+
 STORE = JsonContentStore(STORAGE_DIR)
+SOURCE_STORE = JsonSourceStore(SOURCE_STORAGE_DIR)
 
 
 def system_prompt() -> str:
@@ -433,6 +548,131 @@ Return JSON only:
 }}
 
 Use Bahasa Indonesia, calm wording, and the same dakwah safety rules."""
+
+
+def ideas_from_source_prompt(source: dict[str, Any], transcript_text: str) -> str:
+    return f"""Generate 10 safe content ideas from this source.
+
+Source:
+- sourceId: {source.get("sourceId")}
+- title: {source.get("title")}
+- speakerName: {source.get("speakerName")}
+- platform: {source.get("platform")}
+- sourceUrl: {source.get("sourceUrl")}
+- permissionStatus: {source.get("permissionStatus")}
+- creditText: {source.get("creditText")}
+- contextNotes: {source.get("contextNotes")}
+
+Transcript/context excerpt:
+{transcript_text[:6000] or "-"}
+
+Rules:
+- Bahasa Indonesia.
+- Do not invent Quran verses.
+- Do not invent hadith.
+- Do not produce fatwa-style conclusions.
+- Do not add speaker attribution beyond the source metadata.
+- Prefer pengingat, hikmah, renungan, or catatan framing.
+- For each idea, mark riskLevel low, medium, or high.
+- Mark needsContext true if the idea needs previous/next context.
+- sourceCreditRequired should be true unless this is own_content/internal note.
+
+Return JSON only:
+{{
+  "sourceId": "string",
+  "ideas": [
+    {{
+      "title": "string",
+      "angle": "string",
+      "suggestedTopic": "string",
+      "riskLevel": "low|medium|high",
+      "needsContext": true,
+      "sourceCreditRequired": true,
+      "notes": "string"
+    }}
+  ],
+  "safetyNotes": ["string"]
+}}"""
+
+
+def source_content_prompt(source: dict[str, Any], transcript_text: str, topic: str, segment: Optional[dict[str, Any]] = None) -> str:
+    segment_context = ""
+    if segment:
+        segment_context = f"""
+Segment:
+- segmentId: {segment.get("segmentId")}
+- riskLevel: {segment.get("riskLevel")}
+- contextNotes: {segment.get("contextNotes")}
+- text: {segment.get("text")}
+"""
+    return f"""Create one Annotasi Hikmah carousel package from the source context.
+
+Requested topic: {topic or source.get("topic") or source.get("title")}
+
+Source:
+- sourceId: {source.get("sourceId")}
+- sourceTitle: {source.get("title")}
+- speakerName: {source.get("speakerName")}
+- sourceUrl: {source.get("sourceUrl")}
+- creditText: {source.get("creditText")}
+- permissionStatus: {source.get("permissionStatus")}
+- sourceStatus: {source.get("sourceStatus")}
+- contextNotes: {source.get("contextNotes")}
+{segment_context}
+
+Transcript/context:
+{transcript_text[:7000] or "-"}
+
+Rules:
+- Bahasa Indonesia.
+- Do not invent Quran verses.
+- Do not invent hadith.
+- Do not make fatwa-style conclusions.
+- Do not attribute any claim to the speaker unless it is supported by the source context.
+- If context is partial, add manual review warning in safetyNotes.
+- Always include a source credit suggestion.
+- Keep tone calm, reflective, respectful, not clickbait.
+- Default to 7 slides, each slide short and readable.
+
+Return JSON only using this schema:
+{{
+  "title": "string",
+  "niche": "string",
+  "tone": "string",
+  "source": {{
+    "sourceId": "string",
+    "sourceTitle": "string",
+    "speakerName": "string",
+    "sourceUrl": "string",
+    "creditText": "string",
+    "permissionStatus": "string",
+    "segmentId": "string|null",
+    "riskLevel": "low|medium|high"
+  }},
+  "slides": [
+    {{
+      "slideNumber": 1,
+      "type": "hook|body|closing",
+      "text": "string",
+      "visualDirection": "string"
+    }}
+  ],
+  "caption": "string",
+  "hashtags": ["string"],
+  "voiceoverScript": "string",
+  "videoStoryboard": [
+    {{
+      "sceneNumber": 1,
+      "durationSeconds": 5,
+      "visual": "string",
+      "motion": "string",
+      "voiceoverPart": "string"
+    }}
+  ],
+  "safetyNotes": ["string"],
+  "sourceCreditSuggestion": "string",
+  "callToAction": "string"
+}}"""
 
 
 def call_ai_json(messages: list[dict[str, str]]) -> dict[str, Any]:
@@ -843,8 +1083,51 @@ def format_review_for_telegram(record: dict[str, Any]) -> list[str]:
         "Slides:",
         f"{len(slides) if isinstance(slides, list) else 0} slides",
         "",
-        "Checklist:",
     ]
+    link = record.get("sourceLink")
+    if isinstance(link, dict) and link.get("sourceId"):
+        try:
+            linked_source = SOURCE_STORE.get(str(link["sourceId"]))
+            lines.extend(
+                [
+                    "Source:",
+                    f"{linked_source.get('sourceId')} - {linked_source.get('title')}",
+                    "",
+                    "Speaker:",
+                    str(linked_source.get("speakerName") or "-"),
+                    "",
+                    "Permission:",
+                    str(linked_source.get("permissionStatus") or "-"),
+                    "",
+                    "Credit:",
+                    str(linked_source.get("creditText") or "-"),
+                    "",
+                    "Segment:",
+                    str(link.get("segmentId") or "none"),
+                    "",
+                    "Risk:",
+                    str(link.get("riskLevel") or "medium"),
+                    "",
+                    "Source checklist:",
+                    "[ ] Source is linked",
+                    "[ ] Credit text is included",
+                    "[ ] Permission status reviewed",
+                    "[ ] Segment context reviewed",
+                    "[ ] No meaning is cut out of context",
+                    "",
+                ]
+            )
+        except AppError:
+            lines.extend(["Source:", f"{link.get('sourceId')} (not found)", ""])
+    else:
+        lines.extend(
+            [
+                "Source:",
+                "Content has no linked source. If inspired by kajian/video, add source before posting.",
+                "",
+            ]
+        )
+    lines.append("Checklist:")
     for item in checklist:
         marker = "[x]" if item["checked"] else "[ ]"
         lines.append(f"{marker} {item['label']}")
@@ -2293,6 +2576,728 @@ def list_content_by_status(status: str = "", limit: int = 20) -> dict[str, Any]:
     }
 
 
+def validate_source_type(value: str) -> str:
+    normalized = (value or "other").strip().lower()
+    if normalized not in SUPPORTED_SOURCE_TYPES:
+        raise AppError(HTTPStatus.BAD_REQUEST, "invalid_source_type", "Source type is invalid.")
+    return normalized
+
+
+def validate_source_platform(value: str) -> str:
+    normalized = (value or "other").strip().lower()
+    if normalized not in SUPPORTED_SOURCE_PLATFORMS:
+        raise AppError(HTTPStatus.BAD_REQUEST, "invalid_source_platform", "Source platform is invalid.")
+    return normalized
+
+
+def validate_permission_status(value: str) -> str:
+    normalized = (value or SOURCE_DEFAULT_PERMISSION_STATUS).strip().lower()
+    if normalized not in SUPPORTED_PERMISSION_STATUSES:
+        raise AppError(HTTPStatus.BAD_REQUEST, "invalid_permission_status", "Permission status is invalid.")
+    return normalized
+
+
+def validate_source_status(value: str) -> str:
+    normalized = (value or "draft").strip().lower()
+    if normalized not in SUPPORTED_SOURCE_STATUSES:
+        raise AppError(HTTPStatus.BAD_REQUEST, "invalid_source_status", "Source status is invalid.")
+    return normalized
+
+
+def validate_risk_level(value: str) -> str:
+    normalized = (value or "low").strip().lower()
+    if normalized not in SUPPORTED_RISK_LEVELS:
+        raise AppError(HTTPStatus.BAD_REQUEST, "invalid_risk_level", "Risk level is invalid.")
+    return normalized
+
+
+def source_summary(source: dict[str, Any]) -> dict[str, Any]:
+    transcript = source.get("transcript") if isinstance(source.get("transcript"), dict) else {}
+    segments = transcript.get("segments") if isinstance(transcript, dict) else []
+    links = source.get("generatedContent") if isinstance(source.get("generatedContent"), list) else []
+    return {
+        "sourceId": source.get("sourceId"),
+        "title": source.get("title", ""),
+        "speakerName": source.get("speakerName", ""),
+        "sourceType": source.get("sourceType", ""),
+        "platform": source.get("platform", ""),
+        "sourceUrl": source.get("sourceUrl", ""),
+        "permissionStatus": source.get("permissionStatus", ""),
+        "creditText": source.get("creditText", ""),
+        "topic": source.get("topic", ""),
+        "sourceStatus": source.get("sourceStatus", ""),
+        "transcriptAvailable": bool(transcript.get("transcriptText")),
+        "segmentCount": len(segments) if isinstance(segments, list) else 0,
+        "generatedContentCount": len(links),
+        "contextNotes": source.get("contextNotes", ""),
+    }
+
+
+def format_source_list_for_telegram(sources: list[dict[str, Any]]) -> list[str]:
+    if not sources:
+        return ["Source List\n\nNo sources found."]
+    lines = ["Source List", ""]
+    for index, source in enumerate(sources, start=1):
+        summary = source_summary(source)
+        lines.extend(
+            [
+                f"{index}. {summary['sourceId']} - {summary['title']}",
+                f"Speaker: {summary['speakerName'] or '-'}",
+                f"Permission: {summary['permissionStatus']}",
+                f"Status: {summary['sourceStatus']}",
+                "",
+            ]
+        )
+    return split_telegram_message("\n".join(lines).strip())
+
+
+def format_source_detail_for_telegram(source: dict[str, Any]) -> list[str]:
+    summary = source_summary(source)
+    transcript_status = "available" if summary["transcriptAvailable"] else "not_available"
+    text = "\n".join(
+        [
+            "Source Detail",
+            "",
+            "Source ID:",
+            str(summary["sourceId"]),
+            "",
+            "Title:",
+            str(summary["title"]),
+            "",
+            "Speaker:",
+            str(summary["speakerName"] or "-"),
+            "",
+            "URL:",
+            str(summary["sourceUrl"] or "-"),
+            "",
+            "Permission:",
+            str(summary["permissionStatus"]),
+            "",
+            "Credit:",
+            str(summary["creditText"] or "-"),
+            "",
+            "Status:",
+            str(summary["sourceStatus"]),
+            "",
+            "Transcript:",
+            transcript_status,
+            "",
+            "Generated content:",
+            f"{summary['generatedContentCount']} items",
+            "",
+            "Notes:",
+            str(summary["contextNotes"] or "-"),
+        ]
+    )
+    return split_telegram_message(text)
+
+
+def format_source_review_for_telegram(source: dict[str, Any]) -> list[str]:
+    checklist = [
+        "Source URL is valid",
+        "Speaker/source is clear",
+        "Permission status is checked",
+        "Credit text is ready",
+        "Topic is appropriate",
+        "No misleading use intended",
+        "Not a restricted source",
+        "Monetization risk understood",
+        "Manual context review required before posting",
+    ]
+    lines = [
+        "Source Review",
+        "",
+        "Source ID:",
+        str(source.get("sourceId")),
+        "",
+        "Title:",
+        str(source.get("title", "")),
+        "",
+        "Permission:",
+        str(source.get("permissionStatus", "")),
+        "",
+        "Checklist:",
+    ]
+    lines.extend([f"[ ] {item}" for item in checklist])
+    lines.extend(
+        [
+            "",
+            "Reminder:",
+            "Boleh disebarkan untuk dakwah belum tentu otomatis aman untuk monetisasi. Tetap beri sumber dan nilai tambah.",
+        ]
+    )
+    return split_telegram_message("\n".join(lines).strip())
+
+
+def format_transcript_summary_for_telegram(source: dict[str, Any]) -> list[str]:
+    transcript = source.get("transcript") if isinstance(source.get("transcript"), dict) else {}
+    text = str(transcript.get("transcriptText") or "")
+    segments = transcript.get("segments") if isinstance(transcript.get("segments"), list) else []
+    preview = text[:500] + ("..." if len(text) > 500 else "")
+    lines = [
+        "Transcript Summary",
+        "",
+        "Source ID:",
+        str(source.get("sourceId")),
+        "",
+        "Transcript ID:",
+        str(transcript.get("transcriptId") or "-"),
+        "",
+        "Length:",
+        f"{len(text)} characters",
+        "",
+        "Segments:",
+        str(len(segments)),
+        "",
+        "Status:",
+        str(transcript.get("transcriptStatus") or "not_available"),
+        "",
+        "Preview:",
+        preview or "-",
+    ]
+    return split_telegram_message("\n".join(lines).strip())
+
+
+def time_label(seconds: Any) -> str:
+    if seconds is None:
+        return "unknown"
+    try:
+        total = int(seconds)
+    except (TypeError, ValueError):
+        return "unknown"
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def format_segments_for_telegram(source: dict[str, Any]) -> list[str]:
+    transcript = source.get("transcript") if isinstance(source.get("transcript"), dict) else {}
+    segments = transcript.get("segments") if isinstance(transcript.get("segments"), list) else []
+    if not segments:
+        return ["Transcript Segments\n\nNo segments found."]
+    lines = ["Transcript Segments", ""]
+    for index, segment in enumerate(segments, start=1):
+        preview = str(segment.get("text") or "")[:180]
+        lines.extend(
+            [
+                f"{index}. {segment.get('segmentId')}",
+                f"Time: {time_label(segment.get('startTimeSeconds'))} - {time_label(segment.get('endTimeSeconds'))}",
+                f"Topic: {segment.get('topic') or '-'}",
+                f"Risk: {segment.get('riskLevel')}",
+                f"Preview: {preview}",
+                "",
+            ]
+        )
+    return split_telegram_message("\n".join(lines).strip())
+
+
+def format_segment_detail_for_telegram(source: dict[str, Any], segment: dict[str, Any]) -> list[str]:
+    text = "\n".join(
+        [
+            "Segment Detail",
+            "",
+            "Segment ID:",
+            str(segment.get("segmentId")),
+            "",
+            "Source:",
+            str(source.get("sourceId")),
+            "",
+            "Time:",
+            f"{time_label(segment.get('startTimeSeconds'))} - {time_label(segment.get('endTimeSeconds'))}",
+            "",
+            "Risk:",
+            str(segment.get("riskLevel")),
+            "",
+            "Text:",
+            str(segment.get("text") or ""),
+            "",
+            "Context notes:",
+            str(segment.get("contextNotes") or "-"),
+        ]
+    )
+    return split_telegram_message(text)
+
+
+def create_source(body: dict[str, Any]) -> dict[str, Any]:
+    title = str(body.get("title") or "").strip()
+    if not title:
+        raise AppError(HTTPStatus.BAD_REQUEST, "missing_source_title", "Source title is required.")
+    item_id = source_id()
+    speaker = str(body.get("speakerName") or body.get("speaker") or "").strip()
+    credit = str(body.get("creditText") or "").strip()
+    if not credit and title:
+        credit = f"Sumber: {title}" + (f" - {speaker}" if speaker else "")
+    record = {
+        "sourceId": item_id,
+        "title": title,
+        "speakerName": speaker,
+        "sourceType": validate_source_type(str(body.get("sourceType") or body.get("type") or "other")),
+        "platform": validate_source_platform(str(body.get("platform") or "other")),
+        "sourceUrl": str(body.get("sourceUrl") or body.get("url") or "").strip(),
+        "localFilePath": str(body.get("localFilePath") or "").strip(),
+        "permissionStatus": validate_permission_status(str(body.get("permissionStatus") or body.get("permission") or SOURCE_DEFAULT_PERMISSION_STATUS)),
+        "permissionNotes": str(body.get("permissionNotes") or "").strip(),
+        "creditText": credit,
+        "topic": str(body.get("topic") or "").strip(),
+        "category": str(body.get("category") or "").strip(),
+        "language": str(body.get("language") or SOURCE_DEFAULT_LANGUAGE).strip(),
+        "durationSeconds": parse_float(body.get("durationSeconds"), 0, "durationSeconds"),
+        "sourceStatus": validate_source_status(str(body.get("sourceStatus") or "needs_review")),
+        "contextNotes": str(body.get("contextNotes") or "").strip(),
+        "transcript": None,
+        "generatedContent": [],
+        "createdAt": now_iso(),
+        "updatedAt": now_iso(),
+    }
+    SOURCE_STORE.save(record)
+    LOGGER.info("source_added source_id=%s", item_id)
+    text = "\n".join(
+        [
+            "Source added",
+            "",
+            "Source ID:",
+            item_id,
+            "",
+            "Title:",
+            title,
+            "",
+            "Speaker:",
+            speaker or "-",
+            "",
+            "Permission:",
+            record["permissionStatus"],
+            "",
+            "Next actions:",
+            f"/source_review {item_id}",
+            f"/transcript_add {item_id} <paste transcript>",
+            "/source_list",
+        ]
+    )
+    return {**record, "telegramMessages": split_telegram_message(text)}
+
+
+def list_sources(params: dict[str, list[str]]) -> dict[str, Any]:
+    status = params.get("status", [""])[0].strip()
+    permission = params.get("permissionStatus", params.get("permission", [""]))[0].strip()
+    platform = params.get("platform", [""])[0].strip()
+    topic = params.get("topic", [""])[0].strip().lower()
+    records = []
+    for source in SOURCE_STORE.list_records():
+        if status and source.get("sourceStatus") != status:
+            continue
+        if permission and source.get("permissionStatus") != permission:
+            continue
+        if platform and source.get("platform") != platform:
+            continue
+        if topic and topic not in str(source.get("topic", "")).lower() and topic not in str(source.get("title", "")).lower():
+            continue
+        records.append(source)
+    return {"sources": [source_summary(item) for item in records], "telegramMessages": format_source_list_for_telegram(records)}
+
+
+def update_source(source_id_value: str, body: dict[str, Any]) -> dict[str, Any]:
+    source = SOURCE_STORE.get(source_id_value)
+    field_map = {
+        "title": "title",
+        "speakerName": "speakerName",
+        "speaker": "speakerName",
+        "sourceUrl": "sourceUrl",
+        "url": "sourceUrl",
+        "localFilePath": "localFilePath",
+        "permissionNotes": "permissionNotes",
+        "creditText": "creditText",
+        "topic": "topic",
+        "category": "category",
+        "language": "language",
+        "contextNotes": "contextNotes",
+    }
+    for incoming, target in field_map.items():
+        if incoming in body:
+            source[target] = str(body.get(incoming) or "").strip()
+    if "sourceType" in body or "type" in body:
+        source["sourceType"] = validate_source_type(str(body.get("sourceType") or body.get("type")))
+    if "platform" in body:
+        source["platform"] = validate_source_platform(str(body.get("platform")))
+    if "permissionStatus" in body or "permission" in body:
+        source["permissionStatus"] = validate_permission_status(str(body.get("permissionStatus") or body.get("permission")))
+    if "sourceStatus" in body:
+        source["sourceStatus"] = validate_source_status(str(body.get("sourceStatus")))
+    source["updatedAt"] = now_iso()
+    SOURCE_STORE.save(source)
+    return {**source, "telegramMessages": format_source_detail_for_telegram(source)}
+
+
+def approve_source(source_id_value: str) -> dict[str, Any]:
+    source = SOURCE_STORE.get(source_id_value)
+    source["sourceStatus"] = "approved"
+    source["updatedAt"] = now_iso()
+    SOURCE_STORE.save(source)
+    LOGGER.info("source_approved source_id=%s", source_id_value)
+    return {**source, "telegramMessages": split_telegram_message(f"Source approved.\n\nYou can now generate content using:\n/from_source {source_id_value}")}
+
+
+def restrict_source(source_id_value: str, body: dict[str, Any]) -> dict[str, Any]:
+    reason = str(body.get("reason") or "").strip()
+    source = SOURCE_STORE.get(source_id_value)
+    source["sourceStatus"] = "restricted"
+    source["permissionStatus"] = "restricted"
+    source["permissionNotes"] = reason
+    source["updatedAt"] = now_iso()
+    SOURCE_STORE.save(source)
+    LOGGER.info("source_restricted source_id=%s", source_id_value)
+    return {**source, "telegramMessages": split_telegram_message(f"Source restricted.\n\nReason:\n{reason or '-'}")}
+
+
+def set_source_credit(source_id_value: str, body: dict[str, Any]) -> dict[str, Any]:
+    credit_text = str(body.get("creditText") or body.get("credit") or "").strip()
+    if not credit_text:
+        raise AppError(HTTPStatus.BAD_REQUEST, "missing_credit_text", "Credit text is required.")
+    source = SOURCE_STORE.get(source_id_value)
+    source["creditText"] = credit_text
+    source["updatedAt"] = now_iso()
+    SOURCE_STORE.save(source)
+    return {**source, "telegramMessages": split_telegram_message(f"Source credit updated.\n\nSource ID:\n{source_id_value}\n\nCredit:\n{credit_text}")}
+
+
+def add_transcript(source_id_value: str, body: dict[str, Any]) -> dict[str, Any]:
+    transcript_text = str(body.get("transcriptText") or body.get("text") or "").strip()
+    if not transcript_text:
+        raise AppError(HTTPStatus.BAD_REQUEST, "empty_transcript", "Transcript text is required.")
+    if len(transcript_text) > TRANSCRIPT_MAX_CHARS_DIRECT:
+        raise AppError(HTTPStatus.BAD_REQUEST, "transcript_too_long", "Transcript is too long for direct input.")
+    source = SOURCE_STORE.get(source_id_value)
+    transcript = {
+        "transcriptId": transcript_id(),
+        "sourceId": source_id_value,
+        "transcriptText": transcript_text,
+        "language": str(body.get("language") or source.get("language") or SOURCE_DEFAULT_LANGUAGE),
+        "transcriptStatus": "available",
+        "segments": [],
+        "createdAt": now_iso(),
+        "updatedAt": now_iso(),
+    }
+    source["transcript"] = transcript
+    source["updatedAt"] = now_iso()
+    SOURCE_STORE.save(source)
+    LOGGER.info("transcript_added source_id=%s transcript_id=%s chars=%d", source_id_value, transcript["transcriptId"], len(transcript_text))
+    text = "\n".join(
+        [
+            "Transcript saved.",
+            "",
+            "Transcript ID:",
+            transcript["transcriptId"],
+            "",
+            "Source ID:",
+            source_id_value,
+            "",
+            "Length:",
+            f"{len(transcript_text)} characters",
+            "",
+            "Next actions:",
+            f"/transcript {source_id_value}",
+            f"/segments_generate {source_id_value}",
+            f"/ideas_from_source {source_id_value}",
+        ]
+    )
+    return {**transcript, "telegramMessages": split_telegram_message(text)}
+
+
+TIMESTAMP_LINE_RE = re.compile(r"^\s*(?:\[|\()?(\d{1,2}:)?(\d{1,2}):(\d{2})(?:\]|\))?(?:\s*-\s*(?:(\d{1,2}:)?(\d{1,2}):(\d{2}))?)?\s*(.*)$")
+
+
+def parse_timestamp_parts(hour: Optional[str], minute: str, second: str) -> int:
+    h = int(hour[:-1]) if hour else 0
+    return h * 3600 + int(minute) * 60 + int(second)
+
+
+def segment_risk_for_text(text: str) -> str:
+    lowered = text.lower()
+    high_markers = ["hadits", "hadith", "quran", "alquran", "ayat", "fatwa", "haram", "halal", "riba"]
+    medium_markers = ["ustadz", "hukum", "dalil", "dosa", "surga", "neraka"]
+    if any(marker in lowered for marker in high_markers):
+        return "high"
+    if any(marker in lowered for marker in medium_markers):
+        return "medium"
+    return "low"
+
+
+def generate_segments(source_id_value: str) -> dict[str, Any]:
+    source = SOURCE_STORE.get(source_id_value)
+    transcript = source.get("transcript") if isinstance(source.get("transcript"), dict) else None
+    if not transcript or not transcript.get("transcriptText"):
+        raise AppError(HTTPStatus.NOT_FOUND, "transcript_not_found", "Transcript was not found.")
+    LOGGER.info("transcript_segmentation_started source_id=%s", source_id_value)
+    text = str(transcript["transcriptText"])
+    segments = []
+    timestamped = []
+    for line in text.splitlines():
+        match = TIMESTAMP_LINE_RE.match(line)
+        if match and match.group(7).strip():
+            start = parse_timestamp_parts(match.group(1), match.group(2), match.group(3))
+            end = parse_timestamp_parts(match.group(4), match.group(5), match.group(6)) if match.group(5) else None
+            timestamped.append((start, end, match.group(7).strip()))
+    if timestamped:
+        for index, (start, end, segment_text) in enumerate(timestamped):
+            next_start = timestamped[index + 1][0] if index + 1 < len(timestamped) else None
+            segments.append(
+                {
+                    "segmentId": segment_id(),
+                    "transcriptId": transcript["transcriptId"],
+                    "sourceId": source_id_value,
+                    "startTimeSeconds": start,
+                    "endTimeSeconds": end if end is not None else next_start,
+                    "text": segment_text,
+                    "topic": source.get("topic", ""),
+                    "contextNotes": "",
+                    "riskLevel": segment_risk_for_text(segment_text),
+                    "createdAt": now_iso(),
+                    "updatedAt": now_iso(),
+                }
+            )
+    else:
+        paragraphs = [part.strip() for part in re.split(r"\n\s*\n+", text) if part.strip()]
+        chunk = []
+        count = 0
+        for paragraph in paragraphs or [text]:
+            words = paragraph.split()
+            if chunk and count + len(words) > TRANSCRIPT_SEGMENT_MAX_WORDS:
+                segment_text = "\n\n".join(chunk)
+                segments.append(
+                    {
+                        "segmentId": segment_id(),
+                        "transcriptId": transcript["transcriptId"],
+                        "sourceId": source_id_value,
+                        "startTimeSeconds": None,
+                        "endTimeSeconds": None,
+                        "text": segment_text,
+                        "topic": source.get("topic", ""),
+                        "contextNotes": "Timestamp tidak tersedia. Segment dibuat berdasarkan struktur teks.",
+                        "riskLevel": segment_risk_for_text(segment_text),
+                        "createdAt": now_iso(),
+                        "updatedAt": now_iso(),
+                    }
+                )
+                chunk = []
+                count = 0
+            chunk.append(paragraph)
+            count += len(words)
+        if chunk:
+            segment_text = "\n\n".join(chunk)
+            segments.append(
+                {
+                    "segmentId": segment_id(),
+                    "transcriptId": transcript["transcriptId"],
+                    "sourceId": source_id_value,
+                    "startTimeSeconds": None,
+                    "endTimeSeconds": None,
+                    "text": segment_text,
+                    "topic": source.get("topic", ""),
+                    "contextNotes": "Timestamp tidak tersedia. Segment dibuat berdasarkan struktur teks.",
+                    "riskLevel": segment_risk_for_text(segment_text),
+                    "createdAt": now_iso(),
+                    "updatedAt": now_iso(),
+                }
+            )
+    transcript["segments"] = segments
+    transcript["updatedAt"] = now_iso()
+    source["updatedAt"] = now_iso()
+    SOURCE_STORE.save(source)
+    LOGGER.info("transcript_segmentation_completed source_id=%s segments=%d", source_id_value, len(segments))
+    message = f"Segments generated\n\nSource ID:\n{source_id_value}\n\nSegments:\n{len(segments)}\n\nReminder:\nJika tidak ada timestamp asli, segment hanya berbasis paragraf/logika, bukan waktu video akurat."
+    return {"sourceId": source_id_value, "segments": segments, "telegramMessages": split_telegram_message(message)}
+
+
+def update_segment(item_segment_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    source, transcript, segment = SOURCE_STORE.find_segment(item_segment_id)
+    if "riskLevel" in body or "risk" in body:
+        segment["riskLevel"] = validate_risk_level(str(body.get("riskLevel") or body.get("risk")))
+    if "contextNotes" in body or "notes" in body:
+        segment["contextNotes"] = str(body.get("contextNotes") or body.get("notes") or "").strip()
+    segment["updatedAt"] = now_iso()
+    transcript["updatedAt"] = now_iso()
+    source["updatedAt"] = now_iso()
+    SOURCE_STORE.save(source)
+    LOGGER.info("segment_updated segment_id=%s", item_segment_id)
+    return {**segment, "telegramMessages": format_segment_detail_for_telegram(source, segment)}
+
+
+def ensure_source_generation_allowed(source: dict[str, Any], override: bool = False) -> list[str]:
+    warnings = []
+    if source.get("sourceStatus") == "restricted" or source.get("permissionStatus") in {"restricted", "rejected"}:
+        if SOURCE_BLOCK_RESTRICTED_GENERATION and not override:
+            raise AppError(HTTPStatus.CONFLICT, "source_restricted", "Source is restricted and cannot be used for generation.")
+        warnings.append("Source is restricted. Manual review is required.")
+    if source.get("sourceStatus") != "approved":
+        message = "Source is not approved. Manual source review is required."
+        if SOURCE_REQUIRE_APPROVAL_FOR_GENERATION and not override:
+            raise AppError(HTTPStatus.CONFLICT, "source_not_approved", message)
+        warnings.append(message)
+    if source.get("permissionStatus") in {"unknown", "needs_permission"}:
+        warnings.append("Permission status is not clear. Add credit and review reuse permission before posting.")
+    return warnings
+
+
+def transcript_context(source: dict[str, Any], segment: Optional[dict[str, Any]] = None) -> str:
+    if segment:
+        return str(segment.get("text") or "")
+    transcript = source.get("transcript") if isinstance(source.get("transcript"), dict) else {}
+    return str(transcript.get("transcriptText") or "")
+
+
+def ideas_from_source(source_id_value: str) -> dict[str, Any]:
+    source = SOURCE_STORE.get(source_id_value)
+    warnings = ensure_source_generation_allowed(source, override=True)
+    text = transcript_context(source)
+    if not text:
+        raise AppError(HTTPStatus.NOT_FOUND, "transcript_not_found", "Transcript is required for source ideas.")
+    LOGGER.info("ideas_from_source_requested source_id=%s", source_id_value)
+    ideas = call_ai_json(
+        [
+            {"role": "system", "content": system_prompt()},
+            {"role": "user", "content": ideas_from_source_prompt(source, text)},
+        ]
+    )
+    if not isinstance(ideas.get("ideas"), list):
+        raise AppError(HTTPStatus.BAD_GATEWAY, "ai_validation_failed", "AI ideas response is invalid.")
+    lines = [f"Ideas from source {source_id_value}", ""]
+    for index, idea in enumerate(ideas["ideas"], start=1):
+        lines.extend([f"{index}. {idea.get('title')}", f"Angle: {idea.get('angle')}", f"Risk: {idea.get('riskLevel')}", ""])
+    if warnings:
+        lines.extend(["Warnings:", *[f"- {warning}" for warning in warnings]])
+    return {**ideas, "warnings": warnings, "telegramMessages": split_telegram_message("\n".join(lines).strip())}
+
+
+def link_source_to_content(record: dict[str, Any], source: dict[str, Any], transcript: Optional[dict[str, Any]], segment: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    link = {
+        "contentId": record["id"],
+        "sourceId": source["sourceId"],
+        "transcriptId": transcript.get("transcriptId") if isinstance(transcript, dict) else "",
+        "segmentId": segment.get("segmentId") if isinstance(segment, dict) else "",
+        "sourceCreditUsed": source.get("creditText", ""),
+        "riskLevel": segment.get("riskLevel") if isinstance(segment, dict) else "medium",
+        "createdAt": now_iso(),
+    }
+    record["sourceLink"] = link
+    links = source.get("generatedContent")
+    if not isinstance(links, list):
+        links = []
+        source["generatedContent"] = links
+    links.append(link)
+    source["updatedAt"] = now_iso()
+    SOURCE_STORE.save(source)
+    LOGGER.info("source_linked_to_content source_id=%s content_id=%s", source["sourceId"], record["id"])
+    return link
+
+
+def generate_content_from_source(source_id_value: str, body: dict[str, Any]) -> dict[str, Any]:
+    source = SOURCE_STORE.get(source_id_value)
+    warnings = ensure_source_generation_allowed(source, bool(body.get("override", False)))
+    transcript = source.get("transcript") if isinstance(source.get("transcript"), dict) else None
+    text = transcript_context(source)
+    if not text:
+        raise AppError(HTTPStatus.NOT_FOUND, "transcript_not_found", "Transcript is required to generate from source.")
+    topic = str(body.get("topic") or "").strip()
+    content = call_ai_json(
+        [
+            {"role": "system", "content": system_prompt()},
+            {"role": "user", "content": source_content_prompt(source, text, topic)},
+        ]
+    )
+    content = validate_content(content)
+    if warnings:
+        content["safetyNotes"].extend(warnings)
+    item_id = content_id()
+    record = {
+        "id": item_id,
+        "status": "needs_review",
+        "topic": topic or source.get("topic") or source.get("title"),
+        "niche": "annotasi_hikmah",
+        "tone": "calm_reflective",
+        "platform": "instagram",
+        "content": content,
+        "createdAt": now_iso(),
+        "updatedAt": now_iso(),
+    }
+    ensure_workflow(record)
+    set_workflow_status(record, "needs_review")
+    link = link_source_to_content(record, source, transcript)
+    STORE.save(record)
+    LOGGER.info("content_generated_from_source source_id=%s content_id=%s", source_id_value, item_id)
+    return {"id": item_id, "status": "needs_review", "content": content, "sourceLink": link, "warnings": warnings, "telegramMessages": format_full_for_telegram(record, include_voiceover=False)}
+
+
+def generate_content_from_segment(item_segment_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    source, transcript, segment = SOURCE_STORE.find_segment(item_segment_id)
+    warnings = ensure_source_generation_allowed(source, bool(body.get("override", False)))
+    if segment.get("riskLevel") in {"medium", "high"}:
+        warnings.append(f"Segment risk is {segment.get('riskLevel')}. Review context manually before posting.")
+    content = call_ai_json(
+        [
+            {"role": "system", "content": system_prompt()},
+            {"role": "user", "content": source_content_prompt(source, str(segment.get("text") or ""), str(body.get("topic") or ""), segment)},
+        ]
+    )
+    content = validate_content(content)
+    content["safetyNotes"].extend(warnings)
+    item_id = content_id()
+    record = {
+        "id": item_id,
+        "status": "needs_review",
+        "topic": segment.get("topic") or source.get("topic") or source.get("title"),
+        "niche": "annotasi_hikmah",
+        "tone": "calm_reflective",
+        "platform": "instagram",
+        "content": content,
+        "createdAt": now_iso(),
+        "updatedAt": now_iso(),
+    }
+    ensure_workflow(record)
+    set_workflow_status(record, "needs_review")
+    link = link_source_to_content(record, source, transcript, segment)
+    STORE.save(record)
+    LOGGER.info("content_generated_from_segment segment_id=%s content_id=%s", item_segment_id, item_id)
+    return {"id": item_id, "status": "needs_review", "content": content, "sourceLink": link, "warnings": warnings, "telegramMessages": format_full_for_telegram(record, include_voiceover=False)}
+
+
+def source_for_content(item_id: str) -> dict[str, Any]:
+    record = STORE.get(item_id)
+    link = record.get("sourceLink")
+    if not isinstance(link, dict) or not link.get("sourceId"):
+        raise AppError(HTTPStatus.NOT_FOUND, "source_link_not_found", "Content has no linked source.")
+    source = SOURCE_STORE.get(str(link["sourceId"]))
+    segment = None
+    if link.get("segmentId"):
+        try:
+            _source, _transcript, segment = SOURCE_STORE.find_segment(str(link["segmentId"]))
+        except AppError:
+            segment = None
+    lines = [
+        "Content Source",
+        "",
+        "Content ID:",
+        item_id,
+        "",
+        "Source ID:",
+        str(source.get("sourceId")),
+        "",
+        "Title:",
+        str(source.get("title")),
+        "",
+        "Credit:",
+        str(source.get("creditText") or "-"),
+        "",
+        "Segment:",
+        str(link.get("segmentId") or "none"),
+        "",
+        "Risk:",
+        str((segment or {}).get("riskLevel") or link.get("riskLevel") or "medium"),
+        "",
+        "Reminder:",
+        "Review kembali sebelum upload agar tidak salah konteks.",
+    ]
+    return {"contentId": item_id, "source": source_summary(source), "link": link, "telegramMessages": split_telegram_message("\n".join(lines).strip())}
+
+
 def generate_content(body: dict[str, Any], default_niche: str) -> dict[str, Any]:
     topic = str(body.get("topic") or "").strip()
     if not topic:
@@ -2479,6 +3484,44 @@ class AnnotasiHandler(BaseHTTPRequestHandler):
             json_response(self, HTTPStatus.OK, list_content_by_status(status, limit))
             return
 
+        if path == "/api/v1/sources":
+            json_response(self, HTTPStatus.OK, list_sources(params))
+            return
+
+        source_review_match = re.fullmatch(r"/api/v1/sources/(src_\d{8}_[a-f0-9]{8})/review", path)
+        if source_review_match:
+            source = SOURCE_STORE.get(source_review_match.group(1))
+            json_response(self, HTTPStatus.OK, {**source, "telegramMessages": format_source_review_for_telegram(source)})
+            return
+
+        source_transcript_match = re.fullmatch(r"/api/v1/sources/(src_\d{8}_[a-f0-9]{8})/transcript", path)
+        if source_transcript_match:
+            source = SOURCE_STORE.get(source_transcript_match.group(1))
+            if not isinstance(source.get("transcript"), dict):
+                raise AppError(HTTPStatus.NOT_FOUND, "transcript_not_found", "Transcript was not found.")
+            json_response(self, HTTPStatus.OK, {**source["transcript"], "telegramMessages": format_transcript_summary_for_telegram(source)})
+            return
+
+        source_segments_match = re.fullmatch(r"/api/v1/sources/(src_\d{8}_[a-f0-9]{8})/segments", path)
+        if source_segments_match:
+            source = SOURCE_STORE.get(source_segments_match.group(1))
+            transcript = source.get("transcript") if isinstance(source.get("transcript"), dict) else {}
+            segments = transcript.get("segments") if isinstance(transcript.get("segments"), list) else []
+            json_response(self, HTTPStatus.OK, {"sourceId": source.get("sourceId"), "segments": segments, "telegramMessages": format_segments_for_telegram(source)})
+            return
+
+        source_detail_match = re.fullmatch(r"/api/v1/sources/(src_\d{8}_[a-f0-9]{8})", path)
+        if source_detail_match:
+            source = SOURCE_STORE.get(source_detail_match.group(1))
+            json_response(self, HTTPStatus.OK, {**source, "summary": source_summary(source), "telegramMessages": format_source_detail_for_telegram(source)})
+            return
+
+        segment_detail_match = re.fullmatch(r"/api/v1/segments/(seg_\d{8}_[a-f0-9]{8})", path)
+        if segment_detail_match:
+            source, transcript, segment = SOURCE_STORE.find_segment(segment_detail_match.group(1))
+            json_response(self, HTTPStatus.OK, {**segment, "sourceId": source.get("sourceId"), "transcriptId": transcript.get("transcriptId"), "telegramMessages": format_segment_detail_for_telegram(source, segment)})
+            return
+
         render_match = re.fullmatch(r"/api/v1/render/(rnd_\d{8}_[a-f0-9]{8})", path)
         if render_match:
             render = STORE.find_render(render_match.group(1))
@@ -2534,6 +3577,11 @@ class AnnotasiHandler(BaseHTTPRequestHandler):
             json_response(self, HTTPStatus.OK, get_content_status(status_match.group(1)))
             return
 
+        content_source_match = re.fullmatch(r"/api/v1/content/(cnt_\d{8}_[a-f0-9]{8})/source", path)
+        if content_source_match:
+            json_response(self, HTTPStatus.OK, source_for_content(content_source_match.group(1)))
+            return
+
         match = re.fullmatch(r"/api/v1/content/(cnt_\d{8}_[a-f0-9]{8})(?:/(caption|voiceover|voiceover-script))?", path)
         if not match:
             raise AppError(HTTPStatus.NOT_FOUND, "not_found", "Route not found.")
@@ -2560,6 +3608,41 @@ class AnnotasiHandler(BaseHTTPRequestHandler):
     def handle_post(self) -> None:
         path = urlparse.urlparse(self.path).path.rstrip("/")
         body = read_json_body(self)
+        if path == "/api/v1/sources":
+            json_response(self, HTTPStatus.OK, create_source(body))
+            return
+        source_approve_match = re.fullmatch(r"/api/v1/sources/(src_\d{8}_[a-f0-9]{8})/approve", path)
+        if source_approve_match:
+            json_response(self, HTTPStatus.OK, approve_source(source_approve_match.group(1)))
+            return
+        source_restrict_match = re.fullmatch(r"/api/v1/sources/(src_\d{8}_[a-f0-9]{8})/restrict", path)
+        if source_restrict_match:
+            json_response(self, HTTPStatus.OK, restrict_source(source_restrict_match.group(1), body))
+            return
+        source_credit_match = re.fullmatch(r"/api/v1/sources/(src_\d{8}_[a-f0-9]{8})/credit", path)
+        if source_credit_match:
+            json_response(self, HTTPStatus.OK, set_source_credit(source_credit_match.group(1), body))
+            return
+        source_transcript_match = re.fullmatch(r"/api/v1/sources/(src_\d{8}_[a-f0-9]{8})/transcript", path)
+        if source_transcript_match:
+            json_response(self, HTTPStatus.OK, add_transcript(source_transcript_match.group(1), body))
+            return
+        source_segments_match = re.fullmatch(r"/api/v1/sources/(src_\d{8}_[a-f0-9]{8})/segments/generate", path)
+        if source_segments_match:
+            json_response(self, HTTPStatus.OK, generate_segments(source_segments_match.group(1)))
+            return
+        source_ideas_match = re.fullmatch(r"/api/v1/sources/(src_\d{8}_[a-f0-9]{8})/ideas", path)
+        if source_ideas_match:
+            json_response(self, HTTPStatus.OK, ideas_from_source(source_ideas_match.group(1)))
+            return
+        source_generate_match = re.fullmatch(r"/api/v1/sources/(src_\d{8}_[a-f0-9]{8})/generate-content", path)
+        if source_generate_match:
+            json_response(self, HTTPStatus.OK, generate_content_from_source(source_generate_match.group(1), body))
+            return
+        segment_generate_match = re.fullmatch(r"/api/v1/segments/(seg_\d{8}_[a-f0-9]{8})/generate-content", path)
+        if segment_generate_match:
+            json_response(self, HTTPStatus.OK, generate_content_from_segment(segment_generate_match.group(1), body))
+            return
         approve_match = re.fullmatch(r"/api/v1/content/(cnt_\d{8}_[a-f0-9]{8})/approve", path)
         if approve_match:
             json_response(self, HTTPStatus.OK, approve_content(approve_match.group(1), body))
@@ -2608,6 +3691,14 @@ class AnnotasiHandler(BaseHTTPRequestHandler):
     def handle_patch(self) -> None:
         path = urlparse.urlparse(self.path).path.rstrip("/")
         body = read_json_body(self)
+        source_match = re.fullmatch(r"/api/v1/sources/(src_\d{8}_[a-f0-9]{8})", path)
+        if source_match:
+            json_response(self, HTTPStatus.OK, update_source(source_match.group(1), body))
+            return
+        segment_match = re.fullmatch(r"/api/v1/segments/(seg_\d{8}_[a-f0-9]{8})", path)
+        if segment_match:
+            json_response(self, HTTPStatus.OK, update_segment(segment_match.group(1), body))
+            return
         slide_match = re.fullmatch(r"/api/v1/content/(cnt_\d{8}_[a-f0-9]{8})/slides/(\d+)", path)
         if slide_match:
             json_response(self, HTTPStatus.OK, edit_slide(slide_match.group(1), int(slide_match.group(2)), body))
