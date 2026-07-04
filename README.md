@@ -23,11 +23,36 @@ This is intentionally a small HTTP service instead of a Hermes patch because the
 
 ## Files
 
-- `app.py` - HTTP service, AI client, validation, JSON storage, render metadata, and Telegram formatting.
+- `app.py` - compatibility entrypoint that calls `annotasi_carousel_studio.main`.
+- `annotasi_carousel_studio/` - Python service package with responsibility-based module boundaries.
 - `render_png.js` - Playwright renderer for branded PNG carousel slides.
 - `package.json` - local Node dependency metadata for Playwright rendering.
 - `.env.example` - environment variables for local or VPS configuration.
 - `README.md` - runbook and Hermes integration notes.
+
+## Python Structure
+
+The service remains a standard-library HTTP app. The root `app.py` is intentionally small so existing process managers and Hermes integration can keep running `python3 app.py`.
+
+Current package layout:
+
+```text
+annotasi_carousel_studio/
+├── main.py
+├── config.py
+├── errors.py
+├── http/
+├── storage/
+├── ai/
+├── content/
+├── render/
+├── source/
+├── candidate/
+├── package/
+└── utils/
+```
+
+`main.py` is the compatibility composition layer for the existing endpoint behavior. The submodules expose responsibility-based import surfaces for config, storage, AI, content workflow, rendering, source/transcript management, candidate management, package export, HTTP helpers, and utilities. This keeps external behavior stable while making future extractions smaller and safer.
 
 ## Environment Variables
 
