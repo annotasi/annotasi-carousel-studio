@@ -36,6 +36,16 @@ DEFAULT_TEMPLATE = os.getenv("CAROUSEL_DEFAULT_TEMPLATE", "annotasi_hikmah_dark"
 CAROUSEL_WIDTH = int(os.getenv("CAROUSEL_WIDTH", "1080"))
 CAROUSEL_HEIGHT = int(os.getenv("CAROUSEL_HEIGHT", "1350"))
 RENDER_TIMEOUT_SECONDS = float(os.getenv("CAROUSEL_RENDER_TIMEOUT_SECONDS", "60"))
+VIDEO_DEFAULT_FORMAT = os.getenv("VIDEO_DEFAULT_FORMAT", "shorts_vertical")
+VIDEO_WIDTH = int(os.getenv("VIDEO_WIDTH", "1080"))
+VIDEO_HEIGHT = int(os.getenv("VIDEO_HEIGHT", "1920"))
+VIDEO_FPS = int(os.getenv("VIDEO_FPS", "30"))
+VIDEO_DURATION_PER_SLIDE_SECONDS = float(os.getenv("VIDEO_DURATION_PER_SLIDE_SECONDS", "5"))
+VIDEO_TRANSITION_SECONDS = float(os.getenv("VIDEO_TRANSITION_SECONDS", "0.5"))
+VIDEO_DEFAULT_MOTION_PRESET = os.getenv("VIDEO_DEFAULT_MOTION_PRESET", "calm_zoom")
+VIDEO_RENDER_TIMEOUT_SECONDS = float(os.getenv("VIDEO_RENDER_TIMEOUT_SECONDS", "180"))
+FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
+FFPROBE_PATH = os.getenv("FFPROBE_PATH", "ffprobe")
 TELEGRAM_LIMIT = int(os.getenv("TELEGRAM_MESSAGE_LIMIT", "3900"))
 SERVICE_DIR = Path(__file__).resolve().parent
 NODE_RENDERER = SERVICE_DIR / "render_png.js"
@@ -77,6 +87,11 @@ def render_id() -> str:
     return f"rnd_{stamp}_{secrets.token_hex(4)}"
 
 
+def video_render_id() -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+    return f"vid_{stamp}_{secrets.token_hex(4)}"
+
+
 def word_count(text: str) -> int:
     return len(re.findall(r"\S+", text.strip()))
 
@@ -92,6 +107,21 @@ def parse_int(
         return default
     try:
         return int(value)
+    except (TypeError, ValueError) as exc:
+        raise AppError(status, code, f"{field_name} must be a number.") from exc
+
+
+def parse_float(
+    value: Any,
+    default: float,
+    field_name: str,
+    status: HTTPStatus = HTTPStatus.BAD_REQUEST,
+    code: str = "invalid_number",
+) -> float:
+    if value in (None, ""):
+        return default
+    try:
+        return float(value)
     except (TypeError, ValueError) as exc:
         raise AppError(status, code, f"{field_name} must be a number.") from exc
 
@@ -180,6 +210,26 @@ class JsonContentStore:
                 if isinstance(item, dict) and item.get("renderId") == item_render_id:
                     return item
         raise AppError(HTTPStatus.NOT_FOUND, "render_not_found", "Render metadata was not found.")
+
+    def find_video_render(self, item_video_render_id: str) -> dict[str, Any]:
+        if not re.fullmatch(r"vid_\d{8}_[a-f0-9]{8}", item_video_render_id):
+            raise AppError(HTTPStatus.BAD_REQUEST, "invalid_video_render_id", "Video render ID format is invalid.")
+        try:
+            paths = list(self.root.glob("cnt_*.json"))
+        except OSError as exc:
+            raise AppError(HTTPStatus.INTERNAL_SERVER_ERROR, "storage_failure", "Could not list content.") from exc
+        for path in paths:
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            video_renders = record.get("videoRenders") if isinstance(record, dict) else None
+            if not isinstance(video_renders, list):
+                continue
+            for item in video_renders:
+                if isinstance(item, dict) and item.get("videoRenderId") == item_video_render_id:
+                    return item
+        raise AppError(HTTPStatus.NOT_FOUND, "video_render_not_found", "Video render metadata was not found.")
 
 
 STORE = JsonContentStore(STORAGE_DIR)
@@ -627,6 +677,415 @@ def normalize_render_result(render: dict[str, Any]) -> dict[str, Any]:
     return {**render, "telegramMessages": format_render_for_telegram(render)}
 
 
+def format_video_for_telegram(video_render: dict[str, Any]) -> list[str]:
+    file_info = video_render.get("file") if isinstance(video_render.get("file"), dict) else {}
+    lines = [
+        "Annotasi Motion Video Rendered",
+        "",
+        "Content ID:",
+        str(video_render.get("contentId", "")),
+        "",
+        "Video Render ID:",
+        str(video_render.get("videoRenderId", "")),
+        "",
+        "Format:",
+        f"Vertical MP4 {video_render.get('width')}x{video_render.get('height')}",
+        "",
+        "Slides:",
+        str(video_render.get("slideCount", "")),
+        "",
+        "Duration:",
+        f"{video_render.get('totalDurationSeconds')} seconds",
+        "",
+        "Output:",
+        str(file_info.get("path") or file_info.get("filename") or "final.mp4"),
+        "",
+        "Reminder:",
+        "Review kembali sebelum upload agar tidak salah konteks.",
+    ]
+    return split_telegram_message("\n".join(lines).strip())
+
+
+def normalize_video_result(video_render: dict[str, Any]) -> dict[str, Any]:
+    return {**video_render, "telegramMessages": format_video_for_telegram(video_render)}
+
+
+def video_file_exists(video_render: dict[str, Any]) -> bool:
+    file_info = video_render.get("file")
+    if not isinstance(file_info, dict):
+        return False
+    path = Path(str(file_info.get("path") or ""))
+    return path.exists() and path.is_file() and path.stat().st_size > 0
+
+
+def latest_completed_video_render(
+    record: dict[str, Any],
+    *,
+    output_format: str,
+    template_name: str,
+    motion_preset: str,
+    width: int,
+    height: int,
+    fps: int,
+    duration_per_slide: float,
+    transition_seconds: float,
+) -> Optional[dict[str, Any]]:
+    video_renders = record.get("videoRenders")
+    if not isinstance(video_renders, list):
+        return None
+    for item in reversed(video_renders):
+        if not isinstance(item, dict):
+            continue
+        if (
+            item.get("status") == "completed"
+            and item.get("format") == output_format
+            and item.get("templateName") == template_name
+            and item.get("motionPreset") == motion_preset
+            and item.get("width") == width
+            and item.get("height") == height
+            and item.get("fps") == fps
+            and float(item.get("durationPerSlideSeconds", -1)) == duration_per_slide
+            and float(item.get("transitionSeconds", -1)) == transition_seconds
+            and video_file_exists(item)
+        ):
+            return item
+    return None
+
+
+def latest_completed_png_render(record: dict[str, Any]) -> Optional[dict[str, Any]]:
+    renders = record.get("renders")
+    if not isinstance(renders, list):
+        return None
+    for item in reversed(renders):
+        if (
+            isinstance(item, dict)
+            and item.get("status") == "completed"
+            and item.get("format") == "instagram_carousel"
+            and render_files_exist(item)
+        ):
+            return item
+    return None
+
+
+def validate_png_files(render: dict[str, Any], expected_slides: int) -> list[dict[str, Any]]:
+    files = render.get("files")
+    if not isinstance(files, list) or not files:
+        raise AppError(HTTPStatus.NOT_FOUND, "png_render_not_found", "PNG render has no files. Run /render first.")
+    ordered = sorted(
+        [item for item in files if isinstance(item, dict)],
+        key=lambda item: int(item.get("slideNumber") or 0),
+    )
+    if len(ordered) != expected_slides:
+        raise AppError(HTTPStatus.UNPROCESSABLE_ENTITY, "png_file_count_mismatch", "PNG file count does not match slide count.")
+    for index, item in enumerate(ordered, start=1):
+        if int(item.get("slideNumber") or 0) != index:
+            raise AppError(HTTPStatus.UNPROCESSABLE_ENTITY, "png_file_count_mismatch", "PNG slide numbers are not sequential.")
+        path = Path(str(item.get("path") or ""))
+        if path.suffix.lower() != ".png":
+            raise AppError(HTTPStatus.UNPROCESSABLE_ENTITY, "invalid_png_file", f"Slide {index} file is not a PNG.")
+        if not path.exists() or not path.is_file():
+            raise AppError(HTTPStatus.NOT_FOUND, "png_files_missing", f"PNG file missing for slide {index}. Run /render again.")
+        item["path"] = str(path)
+    LOGGER.info("png_files_validated count=%d", len(ordered))
+    return ordered
+
+
+def check_ffmpeg_available() -> None:
+    try:
+        completed = subprocess.run(
+            [FFMPEG_PATH, "-version"],
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise AppError(HTTPStatus.SERVICE_UNAVAILABLE, "ffmpeg_not_found", "FFmpeg is not installed or FFMPEG_PATH is invalid.") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise AppError(HTTPStatus.SERVICE_UNAVAILABLE, "ffmpeg_unavailable", "FFmpeg availability check timed out.") from exc
+    if completed.returncode != 0:
+        raise AppError(HTTPStatus.SERVICE_UNAVAILABLE, "ffmpeg_unavailable", "FFmpeg is unavailable.")
+    LOGGER.info("ffmpeg_availability_checked")
+
+
+def run_ffmpeg(args: list[str], timeout: float, failure_code: str, failure_message: str) -> None:
+    try:
+        completed = subprocess.run(
+            args,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise AppError(HTTPStatus.SERVICE_UNAVAILABLE, "ffmpeg_not_found", "FFmpeg is not installed or FFMPEG_PATH is invalid.") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise AppError(HTTPStatus.GATEWAY_TIMEOUT, "video_render_timeout", "FFmpeg video rendering timed out.") from exc
+    if completed.returncode != 0:
+        detail = completed.stderr.strip().splitlines()[-1] if completed.stderr.strip() else failure_message
+        raise AppError(HTTPStatus.BAD_GATEWAY, failure_code, f"{failure_message}: {detail[:300]}")
+
+
+def video_filter_for_slide(
+    *,
+    motion_preset: str,
+    width: int,
+    height: int,
+    fps: int,
+    duration: float,
+    transition: float,
+) -> str:
+    frames = max(1, int(round(duration * fps)))
+    safe_transition = max(0.0, min(transition, duration / 2))
+    fade_in = min(0.25, safe_transition)
+    fade_out_start = max(0.0, duration - safe_transition)
+    foreground_width = width
+    foreground_height = min(height, int(round(width * 1.25)))
+    base_scale = (
+        f"[0:v]scale={foreground_width}:{foreground_height}:force_original_aspect_ratio=decrease,"
+        f"pad={foreground_width}:{foreground_height}:(ow-iw)/2:(oh-ih)/2:color=#12110d"
+    )
+    if motion_preset == "calm_zoom":
+        foreground = (
+            f"{base_scale},"
+            f"zoompan=z='min(zoom+0.00035,1.035)':d={frames}:"
+            f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={foreground_width}x{foreground_height}:"
+            f"fps={fps}[fg]"
+        )
+    else:
+        foreground = f"{base_scale},setsar=1[fg]"
+    return (
+        f"{foreground};"
+        f"[1:v][fg]overlay=(W-w)/2:(H-h)/2:format=auto,"
+        f"format=yuv420p,"
+        f"fade=t=in:st=0:d={fade_in:.3f},"
+        f"fade=t=out:st={fade_out_start:.3f}:d={safe_transition:.3f}[v]"
+    )
+
+
+def create_video_segment(
+    *,
+    png_path: Path,
+    segment_path: Path,
+    motion_preset: str,
+    width: int,
+    height: int,
+    fps: int,
+    duration: float,
+    transition: float,
+) -> None:
+    filter_graph = video_filter_for_slide(
+        motion_preset=motion_preset,
+        width=width,
+        height=height,
+        fps=fps,
+        duration=duration,
+        transition=transition,
+    )
+    args = [
+        FFMPEG_PATH,
+        "-y",
+        "-loop",
+        "1",
+        "-t",
+        f"{duration:.3f}",
+        "-i",
+        str(png_path),
+        "-f",
+        "lavfi",
+        "-t",
+        f"{duration:.3f}",
+        "-i",
+        f"color=c=#12110d:s={width}x{height}:r={fps}",
+        "-filter_complex",
+        filter_graph,
+        "-map",
+        "[v]",
+        "-frames:v",
+        str(max(1, int(round(duration * fps)))),
+        "-r",
+        str(fps),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        str(segment_path),
+    ]
+    run_ffmpeg(args, VIDEO_RENDER_TIMEOUT_SECONDS, "ffmpeg_segment_failed", "FFmpeg failed to render a slide segment")
+
+
+def concat_segments(segment_paths: list[Path], concat_file: Path, output_path: Path) -> None:
+    lines = []
+    for segment_path in segment_paths:
+        escaped = str(segment_path).replace("'", "'\\''")
+        lines.append(f"file '{escaped}'")
+    concat_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    args = [
+        FFMPEG_PATH,
+        "-y",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        str(concat_file),
+        "-c",
+        "copy",
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    ]
+    run_ffmpeg(args, VIDEO_RENDER_TIMEOUT_SECONDS, "ffmpeg_concat_failed", "FFmpeg failed to export final MP4")
+
+
+def write_video_metadata(output_dir: Path, video_render: dict[str, Any]) -> None:
+    metadata_path = output_dir / "render-metadata.json"
+    try:
+        metadata_path.write_text(json.dumps(video_render, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as exc:
+        raise AppError(HTTPStatus.INTERNAL_SERVER_ERROR, "metadata_write_failed", "Could not write video metadata.") from exc
+
+
+def render_content_video(item_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    output_format = str(body.get("format") or VIDEO_DEFAULT_FORMAT).strip()
+    template_name = str(body.get("template") or DEFAULT_TEMPLATE).strip()
+    motion_preset = str(body.get("motionPreset") or VIDEO_DEFAULT_MOTION_PRESET).strip()
+    force_regenerate = bool(body.get("forceRegenerate", False))
+    width = parse_int(body.get("width"), VIDEO_WIDTH, "width")
+    height = parse_int(body.get("height"), VIDEO_HEIGHT, "height")
+    fps = parse_int(body.get("fps"), VIDEO_FPS, "fps")
+    duration_per_slide = parse_float(body.get("durationPerSlideSeconds"), VIDEO_DURATION_PER_SLIDE_SECONDS, "durationPerSlideSeconds")
+    transition_seconds = parse_float(body.get("transitionSeconds"), VIDEO_TRANSITION_SECONDS, "transitionSeconds")
+
+    if output_format != "shorts_vertical":
+        raise AppError(HTTPStatus.BAD_REQUEST, "unsupported_format", "Only shorts_vertical is supported.")
+    if template_name != "annotasi_hikmah_dark":
+        raise AppError(HTTPStatus.BAD_REQUEST, "template_not_found", "Template was not found.")
+    if motion_preset not in {"calm_zoom", "static"}:
+        raise AppError(HTTPStatus.BAD_REQUEST, "unsupported_motion_preset", "Only calm_zoom and static are supported.")
+    if width <= 0 or height <= 0 or fps <= 0:
+        raise AppError(HTTPStatus.BAD_REQUEST, "invalid_video_settings", "Video dimensions and fps must be positive.")
+    if duration_per_slide <= 0 or transition_seconds < 0:
+        raise AppError(HTTPStatus.BAD_REQUEST, "invalid_video_settings", "Video durations must be valid positive numbers.")
+    if body.get("includeVoiceover") or body.get("voiceoverAudioPath"):
+        raise AppError(HTTPStatus.BAD_REQUEST, "voiceover_not_supported", "Voiceover audio mixing is reserved for a future milestone.")
+    if body.get("backgroundMusicPath"):
+        raise AppError(HTTPStatus.BAD_REQUEST, "background_music_not_supported", "Background music mixing is reserved for a future milestone.")
+
+    LOGGER.info("video_render_request_received content_id=%s format=%s preset=%s", item_id, output_format, motion_preset)
+    record = STORE.get(item_id)
+    slides = validate_renderable_content(record)
+    LOGGER.info("content_loaded content_id=%s slides=%d", item_id, len(slides))
+
+    png_render = latest_completed_png_render(record)
+    if not png_render:
+        raise AppError(HTTPStatus.NOT_FOUND, "png_render_not_found", "PNG render not found. Run /render <content_id> first.")
+    png_files = validate_png_files(png_render, len(slides))
+    LOGGER.info("png_render_loaded content_id=%s render_id=%s", item_id, png_render.get("renderId"))
+
+    existing = latest_completed_video_render(
+        record,
+        output_format=output_format,
+        template_name=template_name,
+        motion_preset=motion_preset,
+        width=width,
+        height=height,
+        fps=fps,
+        duration_per_slide=duration_per_slide,
+        transition_seconds=transition_seconds,
+    )
+    if existing and not force_regenerate:
+        LOGGER.info("duplicate_video_render_returned content_id=%s video_render_id=%s", item_id, existing.get("videoRenderId"))
+        return normalize_video_result(existing)
+
+    check_ffmpeg_available()
+
+    item_video_render_id = video_render_id()
+    output_dir = (EXPORT_DIR / item_id / item_video_render_id).resolve()
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise AppError(HTTPStatus.INTERNAL_SERVER_ERROR, "output_not_writable", "Output directory is not writable.") from exc
+
+    total_duration = round(len(png_files) * duration_per_slide, 3)
+    output_path = output_dir / "final.mp4"
+    video_render = {
+        "contentId": item_id,
+        "videoRenderId": item_video_render_id,
+        "status": "rendering",
+        "sourcePngRenderId": png_render.get("renderId"),
+        "format": output_format,
+        "templateName": template_name,
+        "motionPreset": motion_preset,
+        "width": width,
+        "height": height,
+        "fps": fps,
+        "durationPerSlideSeconds": duration_per_slide,
+        "transitionSeconds": transition_seconds,
+        "totalDurationSeconds": total_duration,
+        "slideCount": len(png_files),
+        "file": {"filename": "final.mp4", "path": str(output_path), "mimeType": "video/mp4"},
+        "errorMessage": "",
+        "createdAt": now_iso(),
+        "updatedAt": now_iso(),
+    }
+    if not isinstance(record.get("videoRenders"), list):
+        record["videoRenders"] = []
+    record["videoRenders"].append(video_render)
+    record["latestVideoRender"] = video_render
+    record["updatedAt"] = now_iso()
+    STORE.save(record)
+
+    try:
+        LOGGER.info("video_render_plan_created content_id=%s video_render_id=%s slides=%d", item_id, item_video_render_id, len(png_files))
+        segment_paths = []
+        for file_info in png_files:
+            slide_number = int(file_info["slideNumber"])
+            LOGGER.info("segment_generation_started content_id=%s video_render_id=%s slide=%d", item_id, item_video_render_id, slide_number)
+            segment_path = output_dir / f"segment-{slide_number:02d}.mp4"
+            create_video_segment(
+                png_path=Path(str(file_info["path"])),
+                segment_path=segment_path,
+                motion_preset=motion_preset,
+                width=width,
+                height=height,
+                fps=fps,
+                duration=duration_per_slide,
+                transition=transition_seconds,
+            )
+            if not segment_path.exists() or segment_path.stat().st_size <= 0:
+                raise AppError(HTTPStatus.BAD_GATEWAY, "segment_missing", f"Segment missing for slide {slide_number}.")
+            segment_paths.append(segment_path)
+            LOGGER.info("segment_generation_completed content_id=%s video_render_id=%s slide=%d", item_id, item_video_render_id, slide_number)
+
+        LOGGER.info("final_video_export_started content_id=%s video_render_id=%s", item_id, item_video_render_id)
+        concat_segments(segment_paths, output_dir / "segments.txt", output_path)
+        if not output_path.exists() or output_path.stat().st_size <= 0:
+            raise AppError(HTTPStatus.BAD_GATEWAY, "video_output_missing", "Generated MP4 is missing or empty.")
+        LOGGER.info("final_video_export_completed content_id=%s video_render_id=%s", item_id, item_video_render_id)
+    except AppError as exc:
+        video_render["status"] = "failed"
+        video_render["errorMessage"] = exc.message
+        video_render["updatedAt"] = now_iso()
+        record["latestVideoRender"] = video_render
+        record["updatedAt"] = now_iso()
+        STORE.save(record)
+        raise
+
+    video_render["status"] = "completed"
+    video_render["updatedAt"] = now_iso()
+    write_video_metadata(output_dir, video_render)
+    record["latestVideoRender"] = video_render
+    record["updatedAt"] = now_iso()
+    STORE.save(record)
+    LOGGER.info("video_metadata_stored content_id=%s video_render_id=%s", item_id, item_video_render_id)
+    return normalize_video_result(video_render)
+
+
 def call_png_renderer(payload: dict[str, Any]) -> list[dict[str, Any]]:
     if not NODE_RENDERER.exists():
         raise AppError(HTTPStatus.SERVICE_UNAVAILABLE, "render_dependency_unavailable", "PNG renderer script is unavailable.")
@@ -892,6 +1351,21 @@ class AnnotasiHandler(BaseHTTPRequestHandler):
             json_response(self, HTTPStatus.OK, normalize_render_result(render))
             return
 
+        video_render_match = re.fullmatch(r"/api/v1/video-render/(vid_\d{8}_[a-f0-9]{8})", path)
+        if video_render_match:
+            video_render = STORE.find_video_render(video_render_match.group(1))
+            json_response(self, HTTPStatus.OK, normalize_video_result(video_render))
+            return
+
+        latest_video_match = re.fullmatch(r"/api/v1/content/(cnt_\d{8}_[a-f0-9]{8})/render/video", path)
+        if latest_video_match:
+            record = STORE.get(latest_video_match.group(1))
+            video_render = record.get("latestVideoRender")
+            if not isinstance(video_render, dict):
+                raise AppError(HTTPStatus.NOT_FOUND, "video_render_not_found", "No video render exists for this content.")
+            json_response(self, HTTPStatus.OK, normalize_video_result(video_render))
+            return
+
         png_render_match = re.fullmatch(r"/api/v1/content/(cnt_\d{8}_[a-f0-9]{8})/render/png", path)
         if png_render_match:
             record = STORE.get(png_render_match.group(1))
@@ -927,6 +1401,10 @@ class AnnotasiHandler(BaseHTTPRequestHandler):
     def handle_post(self) -> None:
         path = self.path.split("?", 1)[0].rstrip("/")
         body = read_json_body(self)
+        video_render_match = re.fullmatch(r"/api/v1/content/(cnt_\d{8}_[a-f0-9]{8})/render/video", path)
+        if video_render_match:
+            json_response(self, HTTPStatus.OK, render_content_video(video_render_match.group(1), body))
+            return
         png_render_match = re.fullmatch(r"/api/v1/content/(cnt_\d{8}_[a-f0-9]{8})/render/png", path)
         if png_render_match:
             json_response(self, HTTPStatus.OK, render_content_png(png_render_match.group(1), body))
