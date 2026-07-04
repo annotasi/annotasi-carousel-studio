@@ -19,6 +19,7 @@ This is intentionally a small HTTP service instead of a Hermes patch because the
 - Adds review/edit workflow status, render staleness, upload markers, and a simple content calendar.
 - Tracks source materials, transcripts, transcript segments, permissions, credits, and source-content links.
 - Finds transcript highlights and stores clip/content candidates that can be reviewed before content generation.
+- Exports ready-to-upload content packages with media, captions, metadata, ZIP archive, and posting checklists.
 
 ## Files
 
@@ -88,6 +89,14 @@ CANDIDATE_DEFAULT_COUNT=10
 CANDIDATE_MAX_TRANSCRIPT_CHARS=30000
 CANDIDATE_MAX_SEGMENTS_PER_RUN=20
 CANDIDATE_ALLOWED_TYPES=carousel,short_video,voiceover_reflection,quote_post,mixed
+CONTENT_PACKAGE_DIR=./data/packages
+CONTENT_PACKAGE_CREATE_ZIP=true
+CONTENT_PACKAGE_REQUIRE_APPROVAL=true
+CONTENT_PACKAGE_INCLUDE_METADATA=true
+CONTENT_PACKAGE_INCLUDE_PLATFORM_CAPTIONS=true
+CONTENT_PACKAGE_TIMEZONE=Asia/Jakarta
+CONTENT_PACKAGE_MAX_ZIP_SIZE_MB=200
+CONTENT_PACKAGE_ALLOW_STALE_MEDIA=false
 ```
 
 The service logs whether an API key is configured, but never logs the key value.
@@ -496,6 +505,36 @@ curl -s -X POST http://127.0.0.1:8097/api/v1/candidates/cand_20260704_ab12cd34/g
 curl -s http://127.0.0.1:8097/api/v1/content/cnt_20260704_ab12cd34/candidate
 ```
 
+### Content Packages
+
+Check readiness:
+
+```sh
+curl -s http://127.0.0.1:8097/api/v1/content/cnt_20260704_ab12cd34/ready-to-post
+```
+
+Generate a package:
+
+```sh
+curl -s http://127.0.0.1:8097/api/v1/content/cnt_20260704_ab12cd34/package \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "createZip": true,
+    "includeMetadata": true,
+    "includePlatformCaptions": true,
+    "forceRegenerate": false
+  }'
+```
+
+Inspect package status and paths:
+
+```sh
+curl -s http://127.0.0.1:8097/api/v1/content/cnt_20260704_ab12cd34/package/latest
+curl -s http://127.0.0.1:8097/api/v1/content/cnt_20260704_ab12cd34/packages
+curl -s http://127.0.0.1:8097/api/v1/packages/pkg_20260704_ab12cd34
+curl -s http://127.0.0.1:8097/api/v1/content/cnt_20260704_ab12cd34/posting-checklist
+```
+
 ## Hermes Integration
 
 Recommended Telegram command mapping:
@@ -564,6 +603,12 @@ Recommended Telegram command mapping:
 | `/candidate_for_content <content_id>` | `GET /api/v1/content/{content_id}/candidate` |
 | `/candidate_list <status_optional>` | `GET /api/v1/candidate-list?status=<status>` |
 | `/highlights_help` | Show highlight/candidate help text in Hermes |
+| `/package <content_id>` | `POST /api/v1/content/{content_id}/package` |
+| `/package_status <content_id>` | `GET /api/v1/content/{content_id}/package/latest` |
+| `/package_list <content_id>` | `GET /api/v1/content/{content_id}/packages` |
+| `/package_path <package_id>` | `GET /api/v1/packages/{package_id}` |
+| `/posting_checklist <content_id>` | `GET /api/v1/content/{content_id}/posting-checklist` |
+| `/ready_to_post <content_id>` | `GET /api/v1/content/{content_id}/ready-to-post` |
 | `/help` | Show the command list above |
 
 Hermes should send every string in the response `telegramMessages` array as a separate Telegram message, in order. For `/render`, if Hermes supports sending local files or private download links, it can also send each `files[].path` PNG after the text response. For `/video`, Hermes can send `file.path` as a video if the bot adapter and Telegram file size limits allow it; otherwise return the path or private download link.
@@ -954,6 +999,77 @@ Candidate risk handling:
 - high-risk candidates are filtered or blocked unless `CANDIDATE_ALLOW_HIGH_RISK=true` or the request explicitly allows high risk.
 - `aiReasoningSummary` must be a short, user-safe rationale only; hidden chain-of-thought is not requested or stored.
 
+## Content Package Data
+
+Content package metadata is stored inside the content JSON record under `packages`, with `latestPackage` pointing to the newest package. Package files are written under:
+
+```text
+./data/packages/{content_id}/{package_id}/
+```
+
+Package folder structure:
+
+```text
+01-carousel/
+02-video/
+03-copy/
+04-review/
+05-metadata/
+README.md
+```
+
+Generated copy files:
+
+- `03-copy/title.txt`
+- `03-copy/caption-instagram.txt`
+- `03-copy/caption-tiktok.txt`
+- `03-copy/caption-youtube-shorts.txt`
+- `03-copy/hashtags.txt`
+- `03-copy/voiceover-script.txt`
+- `03-copy/source-credit.txt`
+
+Generated review files:
+
+- `04-review/posting-checklist.md`
+- `04-review/dakwah-safety-checklist.md`
+- `04-review/source-context.md`
+
+Generated metadata files:
+
+- `05-metadata/manifest.json`
+- `05-metadata/content.json`
+- `05-metadata/source.json` when linked source exists
+- `05-metadata/candidate.json` when linked candidate exists
+- `05-metadata/render-metadata.json`
+
+Package metadata fields include `packageId`, `contentId`, `status`, `packageDir`, `zipPath`, included file counts, voiceover/source/candidate/checklist flags, warnings, timestamps, and error message.
+
+Package statuses:
+
+```text
+not_started, packaging, completed, failed, stale
+```
+
+Readiness rules:
+
+- content must exist.
+- rejected content is blocked.
+- title, caption, hashtags, posting checklist, and manifest must be available.
+- when `CONTENT_PACKAGE_REQUIRE_APPROVAL=true`, content must be approved before packaging.
+- missing PNG, video, source credit, or voiceover video produce readiness warnings and package warnings.
+
+Staleness rules:
+
+- editing slides, caption, or voiceover marks existing completed packages as `stale`.
+- stale PNG/video/audio render flags are reported in readiness and package warnings.
+- when `CONTENT_PACKAGE_ALLOW_STALE_MEDIA=false`, stale media blocks package creation until `/render`, `/video`, or `/mixvoice` is rerun.
+
+ZIP behavior:
+
+- when `CONTENT_PACKAGE_CREATE_ZIP=true`, the package folder is zipped as `{content_id}-{slugified-title}-{package_id}.zip`.
+- ZIP creation failure does not fail a complete package folder; it is recorded as a warning.
+- ZIPs larger than `CONTENT_PACKAGE_MAX_ZIP_SIZE_MB` are kept but reported as too large for Telegram-style sending.
+
 ## Template
 
 Current template:
@@ -1060,6 +1176,17 @@ The service handles:
 - High-risk candidate blocked by configuration.
 - AI returned no candidates.
 - Long transcript analysis is truncated to `CANDIDATE_MAX_TRANSCRIPT_CHARS`.
+- Package ID not found.
+- Content not approved when `CONTENT_PACKAGE_REQUIRE_APPROVAL=true`.
+- Content rejected before packaging.
+- Missing caption or hashtags before packaging.
+- Stale media blocked by `CONTENT_PACKAGE_ALLOW_STALE_MEDIA=false`.
+- Missing PNG/MP4/voiceover assets reported as package warnings.
+- Package directory not writable.
+- Package file copy failure.
+- Manifest or checklist write failure.
+- ZIP creation failure recorded as a warning when folder package is complete.
+- Duplicate package requests return the latest completed package unless `forceRegenerate=true`.
 
 ## Known Limitations
 
@@ -1082,6 +1209,10 @@ The service handles:
 - YouTube/Instagram/TikTok download is not implemented.
 - Long transcript analysis is capped by `CANDIDATE_MAX_TRANSCRIPT_CHARS` and `CANDIDATE_MAX_SEGMENTS_PER_RUN`.
 - AI risk level is a suggestion only; manual source/context review remains required before publishing.
+- Package export does not auto-post to any social platform.
+- Package ZIP is a local file only; Hermes must implement file sending if desired.
+- Platform caption variants are deterministic and do not call AI.
+- Package export copies existing rendered media; it does not render missing PNG/MP4 files automatically.
 
 ## Manual Test Guide
 
@@ -1383,12 +1514,95 @@ Expected: source, credit, permission, segment, and risk context appear in the re
 
 Expected: candidate ID, source, risk, context warning, source credit, and candidate checklist appear in review output. The generated content remains `needs_review`.
 
-## Suggested Next Milestone
+## Manual Package Test Guide
 
-Milestone 8: add content package export with posting checklist, grouped final media, JSON metadata, captions, source/candidate review notes, and optional ZIP output.
+1. Complete the source-to-content flow:
+
+```text
+/source_add Kajian Rezeki Halal | Ustadz Example | https://youtube.com/example | youtube | allowed_with_credit
+/source_credit <source_id> Sumber: Kajian Rezeki Halal - Ustadz Example
+/source_approve <source_id>
+/transcript_add <source_id> <paste transcript text>
+/segments_generate <source_id>
+/highlights_from_source <source_id>
+/candidate_approve <candidate_id>
+/generate_from_candidate <candidate_id>
+```
+
+2. Review and approve generated content:
+
+```text
+/review <content_id>
+/approve <content_id>
+```
+
+3. Render media:
+
+```text
+/render <content_id>
+/video <content_id>
+/voiceover <content_id>
+/mixvoice_file <content_id> /path/to/voiceover.m4a
+```
+
+4. Schedule and check readiness:
+
+```text
+/schedule <content_id> 2026-07-05 instagram
+/ready_to_post <content_id>
+```
+
+5. Create and inspect package:
+
+```text
+/package <content_id>
+/package_status <content_id>
+/package_list <content_id>
+/package_path <package_id>
+/posting_checklist <content_id>
+```
+
+Expected package folders:
+
+```text
+01-carousel/
+02-video/
+03-copy/
+04-review/
+05-metadata/
+README.md
+```
+
+6. After manual upload:
+
+```text
+/uploaded <content_id> instagram https://instagram.com/example
+```
+
+7. Confirm existing commands still work:
+
+```text
+/status <content_id>
+/calendar week
+/content_list packaged
+/content_list uploaded
+/source_for_content <content_id>
+/candidate_for_content <content_id>
+```
+
+## MVP Complete
+
+Milestone 8 completes the internal MVP of Annotasi Carousel Studio.
+
+The MVP now supports AI content generation, PNG carousel rendering, MP4 vertical rendering, voiceover mixing, review/edit workflow, content calendar, source/transcript management, transcript highlight candidates, final package export, and manual posting checklist.
+
+Recommended next step: use the tool for 30 days, produce 30 to 60 Annotasi Hikmah contents, publish manually, track performance, and identify workflow pain points before adding new major features.
+
+Post-MVP ideas can wait until real usage data exists: performance tracker, simple web dashboard, template manager, topic bank, background music, subtitle overlay, local clip cutter, or analytics loop.
+
 
 ## Suggested Commit Message
 
 ```text
-feat(content): add transcript highlight candidates
+feat(content): add package export and posting checklist
 ```

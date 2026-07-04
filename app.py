@@ -12,9 +12,11 @@ import logging
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 import time
+import zipfile
 from datetime import date, datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -38,6 +40,7 @@ PORT = int(os.getenv("ANNOTASI_PORT", "8097"))
 STORAGE_DIR = Path(os.getenv("CONTENT_STORAGE_DIR", "./data/content"))
 SOURCE_STORAGE_DIR = Path(os.getenv("SOURCE_STORAGE_DIR", "./data/sources"))
 EXPORT_DIR = Path(os.getenv("CONTENT_EXPORT_DIR", "./data/exports"))
+PACKAGE_DIR = Path(os.getenv("CONTENT_PACKAGE_DIR", "./data/packages"))
 DEFAULT_TEMPLATE = os.getenv("CAROUSEL_DEFAULT_TEMPLATE", "annotasi_hikmah_dark")
 CAROUSEL_WIDTH = int(os.getenv("CAROUSEL_WIDTH", "1080"))
 CAROUSEL_HEIGHT = int(os.getenv("CAROUSEL_HEIGHT", "1350"))
@@ -85,6 +88,13 @@ CANDIDATE_ALLOWED_TYPES = {
     for part in os.getenv("CANDIDATE_ALLOWED_TYPES", "carousel,short_video,voiceover_reflection,quote_post,mixed").split(",")
     if part.strip()
 }
+CONTENT_PACKAGE_CREATE_ZIP = os.getenv("CONTENT_PACKAGE_CREATE_ZIP", "true").lower() in {"1", "true", "yes", "on"}
+CONTENT_PACKAGE_REQUIRE_APPROVAL = os.getenv("CONTENT_PACKAGE_REQUIRE_APPROVAL", "true").lower() in {"1", "true", "yes", "on"}
+CONTENT_PACKAGE_INCLUDE_METADATA = os.getenv("CONTENT_PACKAGE_INCLUDE_METADATA", "true").lower() in {"1", "true", "yes", "on"}
+CONTENT_PACKAGE_INCLUDE_PLATFORM_CAPTIONS = os.getenv("CONTENT_PACKAGE_INCLUDE_PLATFORM_CAPTIONS", "true").lower() in {"1", "true", "yes", "on"}
+CONTENT_PACKAGE_TIMEZONE = os.getenv("CONTENT_PACKAGE_TIMEZONE", CONTENT_TIMEZONE)
+CONTENT_PACKAGE_MAX_ZIP_SIZE_MB = float(os.getenv("CONTENT_PACKAGE_MAX_ZIP_SIZE_MB", "200"))
+CONTENT_PACKAGE_ALLOW_STALE_MEDIA = os.getenv("CONTENT_PACKAGE_ALLOW_STALE_MEDIA", "false").lower() in {"1", "true", "yes", "on"}
 TELEGRAM_LIMIT = int(os.getenv("TELEGRAM_MESSAGE_LIMIT", "3900"))
 SERVICE_DIR = Path(__file__).resolve().parent
 NODE_RENDERER = SERVICE_DIR / "render_png.js"
@@ -132,6 +142,7 @@ SUPPORTED_TRANSCRIPT_STATUSES = {"available", "draft", "archived"}
 SUPPORTED_RISK_LEVELS = {"low", "medium", "high"}
 SUPPORTED_CANDIDATE_TYPES = {"carousel", "short_video", "voiceover_reflection", "quote_post", "mixed"}
 SUPPORTED_CANDIDATE_STATUSES = {"suggested", "needs_review", "approved", "rejected", "converted_to_content", "archived"}
+SUPPORTED_PACKAGE_STATUSES = {"not_started", "packaging", "completed", "failed", "stale"}
 
 LOGGER = logging.getLogger("annotasi_carousel_studio")
 
@@ -194,6 +205,11 @@ def video_render_id() -> str:
 def audio_render_id() -> str:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
     return f"aud_{stamp}_{secrets.token_hex(4)}"
+
+
+def package_id() -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+    return f"pkg_{stamp}_{secrets.token_hex(4)}"
 
 
 def source_id() -> str:
@@ -402,6 +418,18 @@ class JsonContentStore:
                 if isinstance(item, dict) and item.get("audioRenderId") == item_audio_render_id:
                     return item
         raise AppError(HTTPStatus.NOT_FOUND, "audio_render_not_found", "Audio render metadata was not found.")
+
+    def find_package(self, item_package_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        if not re.fullmatch(r"pkg_\d{8}_[a-f0-9]{8}", item_package_id):
+            raise AppError(HTTPStatus.BAD_REQUEST, "invalid_package_id", "Package ID format is invalid.")
+        for record in self.list_records():
+            packages = record.get("packages")
+            if not isinstance(packages, list):
+                continue
+            for item in packages:
+                if isinstance(item, dict) and item.get("packageId") == item_package_id:
+                    return record, item
+        raise AppError(HTTPStatus.NOT_FOUND, "package_not_found", "Package metadata was not found.")
 
 
 class JsonSourceStore:
@@ -1195,6 +1223,44 @@ def clear_render_stale(record: dict[str, Any], kind: str) -> None:
         stale[kind] = False
 
 
+def latest_package(record: dict[str, Any]) -> Optional[dict[str, Any]]:
+    packages = record.get("packages")
+    if not isinstance(packages, list):
+        return None
+    for item in reversed(packages):
+        if isinstance(item, dict):
+            return item
+    return None
+
+
+def package_summary(record: dict[str, Any]) -> dict[str, Any]:
+    package = latest_package(record)
+    if not package:
+        return {"status": "not_started", "packageId": "", "packageDir": "", "zipPath": "", "stale": False}
+    stale = package.get("status") == "stale"
+    return {
+        "status": package.get("status", "not_started"),
+        "packageId": package.get("packageId", ""),
+        "packageDir": package.get("packageDir", ""),
+        "zipPath": package.get("zipPath", ""),
+        "stale": stale,
+    }
+
+
+def mark_packages_stale(record: dict[str, Any]) -> None:
+    packages = record.get("packages")
+    if not isinstance(packages, list):
+        return
+    changed = False
+    for item in packages:
+        if isinstance(item, dict) and item.get("status") == "completed":
+            item["status"] = "stale"
+            item["updatedAt"] = now_iso()
+            changed = True
+    if changed:
+        LOGGER.info("packages_marked_stale content_id=%s", record.get("id"))
+
+
 def append_edit_history(record: dict[str, Any], field_name: str, old_value: Any, new_value: Any, edited_by: str = "internal") -> None:
     history = record.get("editHistory")
     if not isinstance(history, list):
@@ -1212,6 +1278,7 @@ def append_edit_history(record: dict[str, Any], field_name: str, old_value: Any,
         }
     )
     ensure_workflow(record)["lastEditedAt"] = now_iso()
+    mark_packages_stale(record)
 
 
 def media_status(record: dict[str, Any], key: str, latest_key: str) -> str:
@@ -1247,6 +1314,7 @@ def workflow_summary(record: dict[str, Any]) -> dict[str, Any]:
             "platform": workflow.get("uploadedPlatform", ""),
             "url": workflow.get("uploadedUrl", ""),
         },
+        "package": package_summary(record),
         "renderStale": workflow.get("renderStale", {}),
     }
 
@@ -1378,6 +1446,7 @@ def format_status_for_telegram(record: dict[str, Any]) -> list[str]:
     summary = workflow_summary(record)
     schedule = summary["schedule"]
     uploaded = summary["uploaded"]
+    package = summary["package"]
     schedule_text = "not scheduled"
     if schedule["date"]:
         schedule_text = f"{schedule['date']} {schedule['time'] or ''} {schedule['platform']}".strip()
@@ -1402,6 +1471,9 @@ def format_status_for_telegram(record: dict[str, Any]) -> list[str]:
             "",
             "Voiceover:",
             str(summary["voiceover"]),
+            "",
+            "Package:",
+            str(package.get("status") or "not_started"),
             "",
             "Schedule:",
             schedule_text,
@@ -2785,12 +2857,16 @@ def query_calendar(params: dict[str, list[str]]) -> dict[str, Any]:
 
 
 def list_content_by_status(status: str = "", limit: int = 20) -> dict[str, Any]:
-    if status and status not in VALID_WORKFLOW_STATUSES:
+    if status and status != "packaged" and status not in VALID_WORKFLOW_STATUSES:
         raise AppError(HTTPStatus.BAD_REQUEST, "invalid_status", "Workflow status is invalid.")
     records = []
     for record in STORE.list_records():
         workflow = ensure_workflow(record)
-        if status and workflow.get("status") != status:
+        if status == "packaged":
+            package = latest_package(record)
+            if not package or package.get("status") not in {"completed", "stale"}:
+                continue
+        elif status and workflow.get("status") != status:
             continue
         records.append(record)
         if len(records) >= limit:
@@ -3810,6 +3886,703 @@ def candidate_for_content(item_id: str) -> dict[str, Any]:
     return {"contentId": item_id, "candidate": candidate, "source": source_summary(source), "telegramMessages": split_telegram_message("\n".join(lines).strip())}
 
 
+def slugify(value: str, fallback: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    return (slug[:80].strip("-") or fallback).lower()
+
+
+def ensure_path_inside(path: Path, roots: list[Path], code: str = "path_not_allowed") -> Path:
+    resolved = path.expanduser().resolve()
+    for root in roots:
+        try:
+            resolved.relative_to(root.resolve())
+            return resolved
+        except ValueError:
+            continue
+    raise AppError(HTTPStatus.BAD_REQUEST, code, "File path is outside allowed directories.")
+
+
+def write_text_file(path: Path, text: str) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    except OSError as exc:
+        raise AppError(HTTPStatus.INTERNAL_SERVER_ERROR, "package_write_failed", f"Could not write {path.name}.") from exc
+
+
+def write_json_file(path: Path, payload: dict[str, Any]) -> None:
+    write_text_file(path, json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def safe_copy_file(source_path: Path, target_path: Path) -> None:
+    source = ensure_path_inside(source_path, [EXPORT_DIR, CONTENT_AUDIO_DIR, PACKAGE_DIR])
+    target = ensure_path_inside(target_path, [PACKAGE_DIR])
+    if not source.exists() or not source.is_file() or source.stat().st_size <= 0:
+        raise AppError(HTTPStatus.NOT_FOUND, "package_asset_missing", f"Asset is missing: {source.name}")
+    if source.name.startswith(".env"):
+        raise AppError(HTTPStatus.BAD_REQUEST, "package_asset_blocked", "Environment files cannot be packaged.")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+    except OSError as exc:
+        raise AppError(HTTPStatus.INTERNAL_SERVER_ERROR, "package_copy_failed", f"Could not copy {source.name}.") from exc
+
+
+def content_text_fields(record: dict[str, Any]) -> tuple[str, str, list[str], str, str]:
+    content = record.get("content") if isinstance(record.get("content"), dict) else {}
+    title = str(content.get("title") or record.get("topic") or "").strip()
+    caption = str(content.get("caption") or "").strip()
+    hashtags = content.get("hashtags")
+    if not isinstance(hashtags, list):
+        hashtags = []
+    hashtags = [str(item).strip() for item in hashtags if str(item).strip()]
+    voiceover = str(content.get("voiceoverScript") or "").strip()
+    source_credit = str(content.get("sourceCreditSuggestion") or "").strip()
+    return title, caption, hashtags, voiceover, source_credit
+
+
+def hashtag_text(hashtags: list[str], multiline: bool = False) -> str:
+    if multiline:
+        return "\n".join(hashtags)
+    return " ".join(hashtags)
+
+
+def short_caption(caption: str, limit: int = 220) -> str:
+    compact = re.sub(r"\s+", " ", caption).strip()
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3].rstrip() + "..."
+
+
+def platform_caption_files(title: str, caption: str, hashtags: list[str]) -> dict[str, str]:
+    tags = hashtag_text(hashtags)
+    return {
+        "caption-instagram.txt": "\n\n".join(part for part in [caption, tags] if part).strip() + "\n",
+        "caption-tiktok.txt": "\n\n".join(part for part in [short_caption(caption), tags] if part).strip() + "\n",
+        "caption-youtube-shorts.txt": "\n\n".join(part for part in [title, caption, tags] if part).strip() + "\n",
+    }
+
+
+def linked_source_and_candidate(record: dict[str, Any]) -> tuple[Optional[dict[str, Any]], Optional[dict[str, Any]]]:
+    source = None
+    candidate = None
+    source_link = record.get("sourceLink")
+    if isinstance(source_link, dict) and source_link.get("sourceId"):
+        try:
+            source = SOURCE_STORE.get(str(source_link["sourceId"]))
+        except AppError:
+            source = None
+    candidate_link = record.get("candidateLink")
+    if isinstance(candidate_link, dict) and candidate_link.get("candidateId"):
+        try:
+            _source, candidate = find_candidate(str(candidate_link["candidateId"]))
+        except AppError:
+            candidate = None
+    return source, candidate
+
+
+def content_is_approved(record: dict[str, Any]) -> bool:
+    workflow = ensure_workflow(record)
+    if workflow.get("reviewStatus") == "approved":
+        return True
+    return str(workflow.get("status") or "") in SCHEDULABLE_STATUSES
+
+
+def completed_png_for_package(record: dict[str, Any]) -> Optional[dict[str, Any]]:
+    render = record.get("latestRender")
+    return render if isinstance(render, dict) and render.get("status") == "completed" and render_files_exist(render) else None
+
+
+def completed_video_for_package(record: dict[str, Any]) -> Optional[dict[str, Any]]:
+    render = record.get("latestVideoRender")
+    return render if isinstance(render, dict) and render.get("status") == "completed" and video_file_exists(render) else None
+
+
+def completed_audio_for_package(record: dict[str, Any]) -> Optional[dict[str, Any]]:
+    render = record.get("latestAudioRender")
+    return render if isinstance(render, dict) and render.get("status") == "completed" and audio_file_exists(render) else None
+
+
+def source_credit_for_package(record: dict[str, Any], source: Optional[dict[str, Any]]) -> str:
+    content = record.get("content") if isinstance(record.get("content"), dict) else {}
+    candidates = [
+        content.get("sourceCreditSuggestion"),
+        record.get("sourceLink", {}).get("sourceCreditUsed") if isinstance(record.get("sourceLink"), dict) else "",
+        source.get("creditText") if isinstance(source, dict) else "",
+    ]
+    for item in candidates:
+        text = str(item or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def package_required_issues(record: dict[str, Any]) -> list[str]:
+    title, caption, hashtags, _voiceover, _source_credit = content_text_fields(record)
+    workflow = ensure_workflow(record)
+    issues = []
+    if workflow.get("status") == "rejected":
+        issues.append("Content is rejected.")
+    if not title:
+        issues.append("Content title is missing.")
+    if not caption:
+        issues.append("Caption is missing.")
+    if not hashtags:
+        issues.append("Hashtags are missing.")
+    if CONTENT_PACKAGE_REQUIRE_APPROVAL and not content_is_approved(record):
+        issues.append("Content must be approved before packaging. Run /review <content_id> and /approve <content_id> first.")
+    return issues
+
+
+def package_warnings(record: dict[str, Any], source: Optional[dict[str, Any]], candidate: Optional[dict[str, Any]]) -> list[str]:
+    _title, _caption, _hashtags, voiceover, _source_credit = content_text_fields(record)
+    workflow = ensure_workflow(record)
+    warnings = []
+    stale = workflow.get("renderStale") if isinstance(workflow.get("renderStale"), dict) else {}
+    if isinstance(stale, dict):
+        if stale.get("png"):
+            warnings.append("PNG render is stale. Rerun /render before posting.")
+        if stale.get("video"):
+            warnings.append("MP4 video render is stale. Rerun /video before posting.")
+        if stale.get("audio"):
+            warnings.append("Voiceover video is stale. Rerun /mixvoice before posting.")
+    if not completed_png_for_package(record):
+        warnings.append("PNG carousel render not found.")
+    if not completed_video_for_package(record):
+        warnings.append("MP4 video render not found.")
+    if voiceover and not completed_audio_for_package(record):
+        warnings.append("Voiceover script exists, but voiceover MP4 was not found.")
+    if source and not source_credit_for_package(record, source):
+        warnings.append("Linked source exists, but source credit is missing.")
+    if source and source.get("permissionStatus") in {"unknown", "needs_permission", "allowed_for_dakwah"}:
+        warnings.append("Source permission requires manual review before monetized posting.")
+    if candidate and candidate.get("needsContext"):
+        warnings.append(str(candidate.get("contextWarning") or "Candidate context must be reviewed manually."))
+    if not CONTENT_PACKAGE_REQUIRE_APPROVAL and not content_is_approved(record):
+        warnings.append("Content is not approved yet.")
+    warnings.append("Review kembali sebelum upload agar tidak salah konteks.")
+    return list(dict.fromkeys([item for item in warnings if item]))
+
+
+def ready_to_post_check(item_id: str) -> dict[str, Any]:
+    record = STORE.get(item_id)
+    source, candidate = linked_source_and_candidate(record)
+    required = package_required_issues(record)
+    warnings = package_warnings(record, source, candidate)
+    stale = ensure_workflow(record).get("renderStale", {})
+    stale_blocked = bool(isinstance(stale, dict) and any(stale.values()) and not CONTENT_PACKAGE_ALLOW_STALE_MEDIA)
+    if stale_blocked:
+        required.append("Media render is stale. Please rerun /render, /video, or /mixvoice before packaging.")
+    missing = [item for item in warnings if "not found" in item or "missing" in item.lower()]
+    ready = not required and not missing
+    return {
+        "contentId": item_id,
+        "ready": ready,
+        "missing": missing,
+        "blockingIssues": required,
+        "warnings": warnings,
+        "summary": workflow_summary(record),
+        "telegramMessages": format_ready_to_post_for_telegram(item_id, ready, missing, required, warnings),
+    }
+
+
+def posting_checklist_text(record: dict[str, Any]) -> str:
+    title, _caption, _hashtags, _voiceover, _source_credit = content_text_fields(record)
+    return "\n".join(
+        [
+            "# Posting Checklist - Annotasi Hikmah",
+            "",
+            "Content ID:",
+            str(record.get("id")),
+            "",
+            "Title:",
+            title or "-",
+            "",
+            "Before upload:",
+            "",
+            "* [ ] Content has been reviewed.",
+            "* [ ] Content status is approved.",
+            "* [ ] PNG carousel is readable.",
+            "* [ ] MP4 video is playable.",
+            "* [ ] Voiceover audio is clear if used.",
+            "* [ ] Caption is ready.",
+            "* [ ] Hashtags are relevant.",
+            "* [ ] Source credit is included if content is based on kajian/transcript.",
+            "* [ ] Source permission status has been checked.",
+            "* [ ] Candidate/segment context has been reviewed.",
+            "* [ ] No invented Quran verse.",
+            "* [ ] No invented hadith.",
+            "* [ ] No unsupported attribution to UAS, UAH, or any ustadz.",
+            "* [ ] Title is not misleading or excessive clickbait.",
+            "* [ ] Meaning is not cut out of context.",
+            "* [ ] Final content is suitable for dakwah/reflection.",
+            "* [ ] Platform selected for posting.",
+            "* [ ] Uploaded URL will be saved using `/uploaded`.",
+            "",
+            "Reminder:",
+            "",
+            "Review kembali sebelum upload agar tidak salah konteks.",
+            "",
+            "Additional warning:",
+            "",
+            "Boleh disebarkan untuk dakwah belum tentu otomatis aman untuk monetisasi. Tetap beri sumber dan nilai tambah.",
+            "",
+        ]
+    )
+
+
+def dakwah_safety_checklist_text() -> str:
+    return "\n".join(
+        [
+            "# Dakwah Safety Checklist",
+            "",
+            "* [ ] Source clarity checked.",
+            "* [ ] Permission clarity checked.",
+            "* [ ] Credit clarity checked.",
+            "* [ ] Context reviewed.",
+            "* [ ] Quran/hadith safety checked.",
+            "* [ ] Attribution safety checked.",
+            "* [ ] Monetization caution reviewed.",
+            "* [ ] No voice cloning used.",
+            "* [ ] No misleading edits.",
+            "* [ ] Manual review completed.",
+            "",
+        ]
+    )
+
+
+def source_context_text(record: dict[str, Any], source: Optional[dict[str, Any]], candidate: Optional[dict[str, Any]]) -> str:
+    if not source:
+        return "No linked source found. If this content was inspired by a kajian, video, transcript, book, or article, add the source before posting.\n"
+    link = record.get("sourceLink") if isinstance(record.get("sourceLink"), dict) else {}
+    candidate_link = record.get("candidateLink") if isinstance(record.get("candidateLink"), dict) else {}
+    candidate_id_value = (candidate or {}).get("candidateId") or candidate_link.get("candidateId") or "-"
+    lines = [
+        "# Source Context",
+        "",
+        f"Source ID: {source.get('sourceId')}",
+        f"Source title: {source.get('title') or '-'}",
+        f"Speaker name: {source.get('speakerName') or '-'}",
+        f"Source URL: {source.get('sourceUrl') or '-'}",
+        f"Source platform: {source.get('platform') or '-'}",
+        f"Permission status: {source.get('permissionStatus') or '-'}",
+        f"Permission notes: {source.get('permissionNotes') or '-'}",
+        f"Credit text: {source.get('creditText') or '-'}",
+        f"Segment ID: {link.get('segmentId') or '-'}",
+        f"Candidate ID: {candidate_id_value}",
+        f"Risk level: {(candidate or {}).get('riskLevel') or link.get('riskLevel') or '-'}",
+        f"Context warning: {(candidate or {}).get('contextWarning') or '-'}",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def package_readme_text(record: dict[str, Any], package: dict[str, Any]) -> str:
+    title, _caption, _hashtags, _voiceover, _source_credit = content_text_fields(record)
+    return "\n".join(
+        [
+            "# Annotasi Content Package",
+            "",
+            "Content ID:",
+            str(record.get("id")),
+            "",
+            "Package ID:",
+            str(package.get("packageId")),
+            "",
+            "Title:",
+            title or "-",
+            "",
+            "How to post manually:",
+            "",
+            "1. Open `01-carousel` for Instagram carousel slides.",
+            "2. Open `02-video` for Shorts/Reels/TikTok video.",
+            "3. Copy caption from `03-copy`.",
+            "4. Include source credit if applicable.",
+            "5. Review `04-review/posting-checklist.md`.",
+            "6. Upload manually to selected platform.",
+            "7. After upload, run:",
+            f"   `/uploaded {record.get('id')} instagram <url>`",
+            "",
+            "Reminder:",
+            "",
+            "Review kembali sebelum upload agar tidak salah konteks.",
+            "",
+        ]
+    )
+
+
+def format_ready_to_post_for_telegram(item_id: str, ready: bool, missing: list[str], blocking: list[str], warnings: list[str]) -> list[str]:
+    lines = ["Ready To Post Check", "", "Content ID:", item_id, "", "Ready:", "yes" if ready else "no", ""]
+    if missing:
+        lines.extend(["Missing:", *[f"- {item}" for item in missing], ""])
+    if blocking:
+        lines.extend(["Blocking:", *[f"- {item}" for item in blocking], ""])
+    if warnings:
+        lines.extend(["Warnings:", *[f"- {item}" for item in warnings], ""])
+    return split_telegram_message("\n".join(lines).strip())
+
+
+def format_posting_checklist_for_telegram(record: dict[str, Any]) -> list[str]:
+    text = posting_checklist_text(record).replace("# Posting Checklist - Annotasi Hikmah", "Posting Checklist")
+    return split_telegram_message(text)
+
+
+def format_package_for_telegram(package: dict[str, Any]) -> list[str]:
+    included = package.get("included") if isinstance(package.get("included"), dict) else {}
+    warnings = package.get("warnings") if isinstance(package.get("warnings"), list) else []
+    lines = [
+        "Content Package Created",
+        "",
+        "Content ID:",
+        str(package.get("contentId")),
+        "",
+        "Package ID:",
+        str(package.get("packageId")),
+        "",
+        "Title:",
+        str(package.get("title") or "-"),
+        "",
+        "Included:",
+        f"- Carousel PNG: {included.get('pngCount', 0)} files",
+        f"- Video MP4: {'yes' if included.get('videoCount', 0) else 'no'}",
+        f"- Voiceover MP4: {'yes' if package.get('hasVoiceoverVideo') else 'no'}",
+        f"- Caption files: {'yes' if included.get('copyFiles', 0) else 'no'}",
+        f"- Source credit: {'yes' if package.get('hasSourceCredit') else 'no'}",
+        f"- Posting checklist: {'yes' if package.get('hasPostingChecklist') else 'no'}",
+        f"- ZIP: {'yes' if package.get('zipPath') else 'no'}",
+        "",
+        "Package:",
+        str(package.get("packageDir") or "-"),
+        "",
+        "ZIP:",
+        str(package.get("zipPath") or "-"),
+        "",
+    ]
+    if warnings:
+        lines.extend(["Warnings:", *[f"- {warning}" for warning in warnings], ""])
+    lines.extend(["Next:", "Upload manual, then run:", f"/uploaded {package.get('contentId')} instagram <url>"])
+    return split_telegram_message("\n".join(lines).strip())
+
+
+def format_package_status_for_telegram(item_id: str, package: Optional[dict[str, Any]]) -> list[str]:
+    if not package:
+        return [f"Package Status\n\nContent ID:\n{item_id}\n\nLatest Package:\nnone\n\nStatus:\nnot_started"]
+    warnings = package.get("warnings") if isinstance(package.get("warnings"), list) else []
+    lines = [
+        "Package Status",
+        "",
+        "Content ID:",
+        item_id,
+        "",
+        "Latest Package:",
+        str(package.get("packageId")),
+        "",
+        "Status:",
+        str(package.get("status")),
+        "",
+        "ZIP:",
+        "available" if package.get("zipPath") else "not available",
+        "",
+        "Stale:",
+        "yes" if package.get("status") == "stale" else "no",
+    ]
+    if warnings:
+        lines.extend(["", "Warnings:", *[f"- {warning}" for warning in warnings]])
+    return split_telegram_message("\n".join(lines).strip())
+
+
+def format_package_list_for_telegram(item_id: str, packages: list[dict[str, Any]]) -> list[str]:
+    lines = ["Package List", "", "Content ID:", item_id, ""]
+    if not packages:
+        lines.append("No packages found.")
+    for index, package in enumerate(packages, start=1):
+        lines.append(f"{index}. {package.get('packageId')} - {package.get('status')} - {package.get('createdAt')}")
+    return split_telegram_message("\n".join(lines).strip())
+
+
+def manifest_for_package(record: dict[str, Any], package: dict[str, Any], source: Optional[dict[str, Any]], candidate: Optional[dict[str, Any]], assets: dict[str, list[str]]) -> dict[str, Any]:
+    workflow = ensure_workflow(record)
+    title, _caption, _hashtags, _voiceover, _source_credit = content_text_fields(record)
+    return {
+        "packageId": package["packageId"],
+        "contentId": record["id"],
+        "title": title,
+        "status": package["status"],
+        "createdAt": package["createdAt"],
+        "timezone": CONTENT_PACKAGE_TIMEZONE,
+        "contentStatus": workflow.get("status"),
+        "schedule": {
+            "scheduledDate": workflow.get("scheduledDate") or None,
+            "scheduledTime": workflow.get("scheduledTime") or None,
+            "platform": workflow.get("scheduledPlatform") or None,
+        },
+        "source": {
+            "sourceId": source.get("sourceId") if source else None,
+            "title": source.get("title") if source else None,
+            "speakerName": source.get("speakerName") if source else None,
+            "sourceUrl": source.get("sourceUrl") if source else None,
+            "permissionStatus": source.get("permissionStatus") if source else None,
+            "creditText": source.get("creditText") if source else None,
+        },
+        "candidate": {
+            "candidateId": candidate.get("candidateId") if candidate else None,
+            "candidateType": candidate.get("candidateType") if candidate else None,
+            "riskLevel": candidate.get("riskLevel") if candidate else None,
+            "needsContext": bool(candidate.get("needsContext")) if candidate else False,
+        },
+        "assets": assets,
+        "warnings": package.get("warnings", []),
+        "postingReminder": "Review kembali sebelum upload agar tidak salah konteks.",
+    }
+
+
+def create_package_zip(package_dir: Path, zip_path: Path) -> None:
+    try:
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for path in sorted(package_dir.rglob("*")):
+                if path.is_file():
+                    archive.write(path, path.relative_to(package_dir))
+    except OSError as exc:
+        raise AppError(HTTPStatus.INTERNAL_SERVER_ERROR, "zip_creation_failed", "Could not create package ZIP.") from exc
+
+
+def generate_content_package(item_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    LOGGER.info("package_request_received content_id=%s", item_id)
+    record = STORE.get(item_id)
+    ensure_workflow(record)
+    force_regenerate = parse_bool(body.get("forceRegenerate"), False)
+    existing = latest_package(record)
+    if existing and existing.get("status") == "completed" and not force_regenerate:
+        LOGGER.info("duplicate_package_returned content_id=%s package_id=%s", item_id, existing.get("packageId"))
+        return {**existing, "telegramMessages": format_package_for_telegram(existing)}
+
+    source, candidate = linked_source_and_candidate(record)
+    required = package_required_issues(record)
+    stale = ensure_workflow(record).get("renderStale", {})
+    if isinstance(stale, dict) and any(stale.values()) and not CONTENT_PACKAGE_ALLOW_STALE_MEDIA:
+        required.append("Media render is stale. Please rerun /render, /video, or /mixvoice before packaging.")
+    if required:
+        raise AppError(HTTPStatus.CONFLICT, "package_not_ready", required[0])
+
+    item_package_id = package_id()
+    title, caption, hashtags, voiceover, _source_credit = content_text_fields(record)
+    package_root = ensure_path_inside((PACKAGE_DIR / item_id).resolve(), [PACKAGE_DIR])
+    package_dir = ensure_path_inside(package_root / item_package_id, [PACKAGE_DIR])
+    zip_path = package_root / f"{item_id}-{slugify(title, item_id)}-{item_package_id}.zip"
+    warnings = package_warnings(record, source, candidate)
+    package = {
+        "packageId": item_package_id,
+        "package_id": item_package_id,
+        "contentId": item_id,
+        "content_id": item_id,
+        "title": title,
+        "status": "packaging",
+        "packageDir": str(package_dir),
+        "package_dir": str(package_dir),
+        "zipPath": "",
+        "zip_path": "",
+        "includedPngCount": 0,
+        "included_png_count": 0,
+        "includedVideoCount": 0,
+        "included_video_count": 0,
+        "includedTextCount": 0,
+        "included_text_count": 0,
+        "hasVoiceoverVideo": False,
+        "has_voiceover_video": False,
+        "hasSourceCredit": False,
+        "has_source_credit": False,
+        "hasCandidateMetadata": bool(candidate),
+        "has_candidate_metadata": bool(candidate),
+        "hasPostingChecklist": False,
+        "has_posting_checklist": False,
+        "warnings": warnings,
+        "warningsJson": json.dumps(warnings, ensure_ascii=False),
+        "warnings_json": json.dumps(warnings, ensure_ascii=False),
+        "included": {"pngCount": 0, "videoCount": 0, "copyFiles": 0, "reviewFiles": 0, "metadataFiles": 0},
+        "errorMessage": "",
+        "error_message": "",
+        "createdAt": now_iso(),
+        "created_at": now_iso(),
+        "updatedAt": now_iso(),
+        "updated_at": now_iso(),
+    }
+    if not isinstance(record.get("packages"), list):
+        record["packages"] = []
+    record["packages"].append(package)
+    record["latestPackage"] = package
+    STORE.save(record)
+
+    try:
+        for dirname in ["01-carousel", "02-video", "03-copy", "04-review", "05-metadata"]:
+            (package_dir / dirname).mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        package["status"] = "failed"
+        package["errorMessage"] = "Package directory is not writable."
+        package["error_message"] = package["errorMessage"]
+        package["updatedAt"] = now_iso()
+        package["updated_at"] = package["updatedAt"]
+        STORE.save(record)
+        raise AppError(HTTPStatus.INTERNAL_SERVER_ERROR, "package_directory_not_writable", "Package directory is not writable.") from exc
+
+    assets = {"carouselPng": [], "videos": [], "copyFiles": [], "reviewFiles": [], "metadataFiles": []}
+    try:
+        png_render = completed_png_for_package(record)
+        if png_render:
+            png_files = validate_png_files(png_render, len(record.get("content", {}).get("slides", [])))
+            for file_info in png_files:
+                slide_number = int(file_info.get("slideNumber") or len(assets["carouselPng"]) + 1)
+                relative = f"01-carousel/slide-{slide_number:02d}.png"
+                safe_copy_file(Path(str(file_info["path"])), package_dir / relative)
+                assets["carouselPng"].append(relative)
+
+        video_render = completed_video_for_package(record)
+        if video_render:
+            video_path = Path(str(video_render.get("file", {}).get("path") if isinstance(video_render.get("file"), dict) else ""))
+            safe_copy_file(video_path, package_dir / "02-video/final.mp4")
+            assets["videos"].append("02-video/final.mp4")
+
+        audio_render = completed_audio_for_package(record)
+        if audio_render:
+            audio_path = Path(str(audio_render.get("outputVideo", {}).get("path") if isinstance(audio_render.get("outputVideo"), dict) else ""))
+            safe_copy_file(audio_path, package_dir / "02-video/final-voiceover.mp4")
+            assets["videos"].append("02-video/final-voiceover.mp4")
+
+        copy_files = {
+            "title.txt": title + "\n",
+            "hashtags.txt": hashtag_text(hashtags, multiline=True) + "\n",
+            "voiceover-script.txt": (voiceover or "-") + "\n",
+            "source-credit.txt": (source_credit_for_package(record, source) or "Source credit missing. Add source credit before posting if this content is source-based.") + "\n",
+        }
+        if parse_bool(body.get("includePlatformCaptions"), CONTENT_PACKAGE_INCLUDE_PLATFORM_CAPTIONS):
+            copy_files.update(platform_caption_files(title, caption, hashtags))
+        else:
+            copy_files["caption-instagram.txt"] = caption + "\n"
+        for filename, text in copy_files.items():
+            write_text_file(package_dir / "03-copy" / filename, text)
+            assets["copyFiles"].append(f"03-copy/{filename}")
+
+        review_files = {
+            "posting-checklist.md": posting_checklist_text(record),
+            "dakwah-safety-checklist.md": dakwah_safety_checklist_text(),
+            "source-context.md": source_context_text(record, source, candidate),
+        }
+        for filename, text in review_files.items():
+            write_text_file(package_dir / "04-review" / filename, text)
+            assets["reviewFiles"].append(f"04-review/{filename}")
+
+        if parse_bool(body.get("includeMetadata"), CONTENT_PACKAGE_INCLUDE_METADATA):
+            metadata = {
+                "content.json": record,
+                "render-metadata.json": {
+                    "latestRender": record.get("latestRender", {}),
+                    "latestVideoRender": record.get("latestVideoRender", {}),
+                    "latestAudioRender": record.get("latestAudioRender", {}),
+                },
+            }
+            if source:
+                metadata["source.json"] = source
+            if candidate:
+                metadata["candidate.json"] = candidate
+            for filename, payload in metadata.items():
+                write_json_file(package_dir / "05-metadata" / filename, payload)
+                assets["metadataFiles"].append(f"05-metadata/{filename}")
+
+        package["includedPngCount"] = len(assets["carouselPng"])
+        package["included_png_count"] = package["includedPngCount"]
+        package["includedVideoCount"] = len(assets["videos"])
+        package["included_video_count"] = package["includedVideoCount"]
+        package["includedTextCount"] = len(assets["copyFiles"]) + len(assets["reviewFiles"])
+        package["included_text_count"] = package["includedTextCount"]
+        package["hasVoiceoverVideo"] = "02-video/final-voiceover.mp4" in assets["videos"]
+        package["has_voiceover_video"] = package["hasVoiceoverVideo"]
+        package["hasSourceCredit"] = bool(source_credit_for_package(record, source))
+        package["has_source_credit"] = package["hasSourceCredit"]
+        package["hasPostingChecklist"] = "04-review/posting-checklist.md" in assets["reviewFiles"]
+        package["has_posting_checklist"] = package["hasPostingChecklist"]
+        package["included"] = {
+            "pngCount": len(assets["carouselPng"]),
+            "videoCount": len(assets["videos"]),
+            "copyFiles": len(assets["copyFiles"]),
+            "reviewFiles": len(assets["reviewFiles"]),
+            "metadataFiles": len(assets["metadataFiles"]),
+        }
+        package["status"] = "completed"
+        manifest = manifest_for_package(record, package, source, candidate, assets)
+        write_json_file(package_dir / "05-metadata/manifest.json", manifest)
+        assets["metadataFiles"].append("05-metadata/manifest.json")
+        write_text_file(package_dir / "README.md", package_readme_text(record, package))
+    except AppError as exc:
+        package["status"] = "failed"
+        package["errorMessage"] = exc.message
+        package["error_message"] = exc.message
+        package["updatedAt"] = now_iso()
+        package["updated_at"] = package["updatedAt"]
+        STORE.save(record)
+        raise
+
+    create_zip = parse_bool(body.get("createZip"), CONTENT_PACKAGE_CREATE_ZIP)
+    if create_zip:
+        try:
+            create_package_zip(package_dir, zip_path)
+            size_mb = zip_path.stat().st_size / (1024 * 1024)
+            package["zipPath"] = str(zip_path)
+            package["zip_path"] = str(zip_path)
+            if size_mb > CONTENT_PACKAGE_MAX_ZIP_SIZE_MB:
+                package["warnings"].append("ZIP is larger than configured Telegram-safe size; return path instead of sending file.")
+        except AppError as exc:
+            package["warnings"].append(f"ZIP creation failed: {exc.message}")
+            package["warningsJson"] = json.dumps(package["warnings"], ensure_ascii=False)
+            package["warnings_json"] = package["warningsJson"]
+
+    package["updatedAt"] = now_iso()
+    package["updated_at"] = package["updatedAt"]
+    package["warningsJson"] = json.dumps(package["warnings"], ensure_ascii=False)
+    package["warnings_json"] = package["warningsJson"]
+    record["latestPackage"] = package
+    record["updatedAt"] = now_iso()
+    STORE.save(record)
+    LOGGER.info("package_completed content_id=%s package_id=%s", item_id, item_package_id)
+    return {**package, "telegramMessages": format_package_for_telegram(package)}
+
+
+def latest_package_status(item_id: str) -> dict[str, Any]:
+    record = STORE.get(item_id)
+    package = latest_package(record)
+    return {"contentId": item_id, "package": package, "telegramMessages": format_package_status_for_telegram(item_id, package)}
+
+
+def list_packages_for_content(item_id: str) -> dict[str, Any]:
+    record = STORE.get(item_id)
+    packages = record.get("packages") if isinstance(record.get("packages"), list) else []
+    packages = [item for item in packages if isinstance(item, dict)]
+    return {"contentId": item_id, "packages": packages, "telegramMessages": format_package_list_for_telegram(item_id, packages)}
+
+
+def package_by_id(item_package_id: str) -> dict[str, Any]:
+    record, package = STORE.find_package(item_package_id)
+    lines = [
+        "Package Path",
+        "",
+        "Package ID:",
+        item_package_id,
+        "",
+        "Content ID:",
+        str(record.get("id")),
+        "",
+        "Directory:",
+        str(package.get("packageDir") or "-"),
+        "",
+        "ZIP:",
+        str(package.get("zipPath") or "-"),
+    ]
+    return {"contentId": record.get("id"), "package": package, "telegramMessages": split_telegram_message("\n".join(lines).strip())}
+
+
+def posting_checklist_for_content(item_id: str) -> dict[str, Any]:
+    record = STORE.get(item_id)
+    return {"contentId": item_id, "checklist": posting_checklist_text(record), "telegramMessages": format_posting_checklist_for_telegram(record)}
+
+
 def ensure_source_generation_allowed(source: dict[str, Any], override: bool = False) -> list[str]:
     warnings = []
     if source.get("sourceStatus") == "restricted" or source.get("permissionStatus") in {"restricted", "rejected"}:
@@ -4183,6 +4956,11 @@ class AnnotasiHandler(BaseHTTPRequestHandler):
             json_response(self, HTTPStatus.OK, list_candidates_by_status(status, limit))
             return
 
+        package_detail_match = re.fullmatch(r"/api/v1/packages/(pkg_\d{8}_[a-f0-9]{8})", path)
+        if package_detail_match:
+            json_response(self, HTTPStatus.OK, package_by_id(package_detail_match.group(1)))
+            return
+
         candidate_detail_match = re.fullmatch(r"/api/v1/candidates/(cand_\d{8}_[a-f0-9]{8})", path)
         if candidate_detail_match:
             source, candidate = find_candidate(candidate_detail_match.group(1))
@@ -4294,6 +5072,26 @@ class AnnotasiHandler(BaseHTTPRequestHandler):
             json_response(self, HTTPStatus.OK, candidate_for_content(content_candidate_match.group(1)))
             return
 
+        package_latest_match = re.fullmatch(r"/api/v1/content/(cnt_\d{8}_[a-f0-9]{8})/package/latest", path)
+        if package_latest_match:
+            json_response(self, HTTPStatus.OK, latest_package_status(package_latest_match.group(1)))
+            return
+
+        packages_match = re.fullmatch(r"/api/v1/content/(cnt_\d{8}_[a-f0-9]{8})/packages", path)
+        if packages_match:
+            json_response(self, HTTPStatus.OK, list_packages_for_content(packages_match.group(1)))
+            return
+
+        ready_match = re.fullmatch(r"/api/v1/content/(cnt_\d{8}_[a-f0-9]{8})/ready-to-post", path)
+        if ready_match:
+            json_response(self, HTTPStatus.OK, ready_to_post_check(ready_match.group(1)))
+            return
+
+        checklist_match = re.fullmatch(r"/api/v1/content/(cnt_\d{8}_[a-f0-9]{8})/posting-checklist", path)
+        if checklist_match:
+            json_response(self, HTTPStatus.OK, posting_checklist_for_content(checklist_match.group(1)))
+            return
+
         match = re.fullmatch(r"/api/v1/content/(cnt_\d{8}_[a-f0-9]{8})(?:/(caption|voiceover|voiceover-script))?", path)
         if not match:
             raise AppError(HTTPStatus.NOT_FOUND, "not_found", "Route not found.")
@@ -4390,6 +5188,10 @@ class AnnotasiHandler(BaseHTTPRequestHandler):
         uploaded_match = re.fullmatch(r"/api/v1/content/(cnt_\d{8}_[a-f0-9]{8})/uploaded", path)
         if uploaded_match:
             json_response(self, HTTPStatus.OK, mark_uploaded(uploaded_match.group(1), body))
+            return
+        package_match = re.fullmatch(r"/api/v1/content/(cnt_\d{8}_[a-f0-9]{8})/package", path)
+        if package_match:
+            json_response(self, HTTPStatus.OK, generate_content_package(package_match.group(1), body))
             return
         audio_prepare_match = re.fullmatch(r"/api/v1/content/(cnt_\d{8}_[a-f0-9]{8})/audio/prepare", path)
         if audio_prepare_match:
