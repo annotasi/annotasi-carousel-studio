@@ -24,7 +24,7 @@ This is intentionally a small HTTP service instead of a Hermes patch because the
 ## Files
 
 - `app.py` - compatibility entrypoint that calls `annotasi_carousel_studio.main`.
-- `annotasi_carousel_studio/` - Python service package with responsibility-based module boundaries.
+- `annotasi_carousel_studio/` - Python service package split by HTTP, storage, AI, content, render, source, candidate, package, and utility responsibilities.
 - `render_png.js` - Playwright renderer for branded PNG carousel slides.
 - `package.json` - local Node dependency metadata for Playwright rendering.
 - `.env.example` - environment variables for local or VPS configuration.
@@ -52,7 +52,7 @@ annotasi_carousel_studio/
 └── utils/
 ```
 
-`main.py` is the compatibility composition layer for the existing endpoint behavior. The submodules expose responsibility-based import surfaces for config, storage, AI, content workflow, rendering, source/transcript management, candidate management, package export, HTTP helpers, and utilities. This keeps external behavior stable while making future extractions smaller and safer.
+`main.py` now only configures logging and starts `ThreadingHTTPServer`. Endpoint handling lives in `http/handler.py`, JSON response helpers live in `http/responses.py`, and business logic lives in the service modules for content workflow, rendering, source/transcript management, candidate management, package export, AI, storage, and utilities. Endpoint paths, JSON response shapes, and local JSON storage formats are intended to remain unchanged by this refactor.
 
 ## Environment Variables
 

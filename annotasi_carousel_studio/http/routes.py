@@ -1,6 +1,5 @@
-"""Route ownership lives on AnnotasiHandler during the compatibility split."""
+from __future__ import annotations
 
-from ..main import AnnotasiHandler
+from .handler import AnnotasiHandler
 
 __all__ = ["AnnotasiHandler"]
-
