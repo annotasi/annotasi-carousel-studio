@@ -9,6 +9,37 @@ from ..utils.ids import *
 from ..utils.time import *
 from ..utils.text import *
 from ..utils.media import *
+
+def content_text_fields(record):
+    """Return common content text fields used by package/checklist formatters."""
+    title = str(record.get("title") or "").strip()
+    caption = str(record.get("caption") or "").strip()
+
+    hashtags_value = record.get("hashtags") or []
+    if isinstance(hashtags_value, list):
+        hashtags = " ".join(
+            tag if str(tag).strip().startswith("#") else "#" + str(tag).strip().lstrip("#")
+            for tag in hashtags_value
+            if str(tag).strip()
+        )
+    else:
+        hashtags = str(hashtags_value or "").strip()
+
+    voiceover = str(
+        record.get("voiceoverScript")
+        or record.get("voiceover")
+        or ""
+    ).strip()
+
+    source_credit = str(
+        record.get("sourceCreditSuggestion")
+        or record.get("sourceCredit")
+        or ""
+    ).strip()
+
+    return title, caption, hashtags, voiceover, source_credit
+
+
 def posting_checklist_text(record: dict[str, Any]) -> str:
     title, _caption, _hashtags, _voiceover, _source_credit = content_text_fields(record)
     return "\n".join(

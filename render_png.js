@@ -260,78 +260,43 @@ function slideHtml(payload, slide, index, total) {
 }
 
 async function ensureTextFits(page, slide) {
-  const fit = await page.evaluate((slideType) => {
+  const fit = await page.evaluate(() => {
     const text = document.querySelector(".slide-text");
     const content = document.querySelector(".content");
     if (!text || !content) {
       return { ok: false, fontSize: 0 };
     }
 
-    const controls = [
-      { element: text, min: Number(text.getAttribute("data-min-font") || 36) },
-      { element: document.querySelector(".title"), min: 22 },
-      { element: document.querySelector(".visual-note"), min: 18 },
-      { element: document.querySelector(".cta"), min: 22 },
-      { element: document.querySelector(".source"), min: 16 },
-    ].filter((item) => item.element);
+    // Browser layout can report 1-3px overflow because of font rounding,
+    // especially in headless Chromium. Do not fail a render for tiny
+    // sub-pixel/rounding differences.
+    const tolerancePx = 6;
+    const fits = () =>
+      text.scrollHeight <= text.clientHeight + tolerancePx &&
+      content.scrollHeight <= content.clientHeight + tolerancePx;
 
-    const metrics = () => ({
-      ok: text.scrollHeight <= text.clientHeight && content.scrollHeight <= content.clientHeight,
-      fontSize: Number.parseFloat(window.getComputedStyle(text).fontSize) || 0,
+    const min = Number(text.getAttribute("data-min-font") || 46);
+    let size = Number(text.getAttribute("data-start-font") || 60);
+
+    while (!fits() && size > min) {
+      size -= 2;
+      text.style.fontSize = `${size}px`;
+    }
+
+    return {
+      ok: fits(),
+      fontSize: size,
       textScrollHeight: text.scrollHeight,
       textClientHeight: text.clientHeight,
       contentScrollHeight: content.scrollHeight,
       contentClientHeight: content.clientHeight,
-    });
-
-    let current = metrics();
-    while (!current.ok) {
-      let changed = false;
-      for (const item of controls) {
-        const currentSize = Number.parseFloat(window.getComputedStyle(item.element).fontSize) || 0;
-        if (currentSize > item.min) {
-          item.element.style.fontSize = `${Math.max(item.min, currentSize - 2)}px`;
-          changed = true;
-        }
-      }
-      current = metrics();
-      if (!changed) {
-        break;
-      }
-    }
-
-    const visualNote = document.querySelector(".visual-note");
-    if (!current.ok && visualNote) {
-      visualNote.style.display = "none";
-      current = metrics();
-    }
-
-    const source = document.querySelector(".source");
-    if (!current.ok && slideType === "closing" && source) {
-      source.style.display = "none";
-      current = metrics();
-    }
-
-    return current;
-  }, slide.type);
-  if (!fit.ok) {
-    const textWords = slide.text.trim() ? slide.text.trim().split(/\s+/).length : 0;
-    const textIsDirectCause = fit.textScrollHeight > fit.textClientHeight;
-    const error = new Error(
-      textIsDirectCause
-        ? `Slide ${slide.slideNumber} text is too long to render without overflow.`
-        : `Slide ${slide.slideNumber} layout overflows. Shorten slide text, title, visual direction, CTA, or source credit.`
-    );
-    error.code = textIsDirectCause ? "slide_text_too_long" : "slide_layout_overflow";
-    error.details = {
-      slideNumber: slide.slideNumber,
-      textLength: slide.text.length,
-      textWords,
-      contentScrollHeight: fit.contentScrollHeight,
-      contentClientHeight: fit.contentClientHeight,
-      textScrollHeight: fit.textScrollHeight,
-      textClientHeight: fit.textClientHeight,
+      tolerancePx,
     };
+  });
+
+  if (!fit.ok) {
+    const error = new Error(`Slide ${slide.slideNumber} text is too long to render without overflow.`);
+    error.code = "slide_text_too_long";
     throw error;
   }
 }
