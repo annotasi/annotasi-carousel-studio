@@ -63,23 +63,6 @@ def validate_renderable_content(record: dict[str, Any]) -> list[dict[str, Any]]:
     return slides
 
 
-def log_render_preflight_metrics(slides: list[dict[str, Any]]) -> None:
-    for index, slide in enumerate(slides, start=1):
-        if not isinstance(slide, dict):
-            continue
-        text = str(slide.get("text") or "")
-        visual_direction = str(slide.get("visualDirection") or "")
-        LOGGER.info(
-            "render_preflight_slide slide=%d type=%s text_words=%d text_length=%d visual_words=%d visual_length=%d",
-            int(slide.get("slideNumber") or index),
-            str(slide.get("type") or ""),
-            word_count(text),
-            len(text),
-            word_count(visual_direction),
-            len(visual_direction),
-        )
-
-
 def render_files_exist(render: dict[str, Any]) -> bool:
     files = render.get("files")
     if not isinstance(files, list) or not files:
@@ -187,9 +170,6 @@ def call_png_renderer(payload: dict[str, Any]) -> list[dict[str, Any]]:
             if isinstance(error_body, dict):
                 code = str(error_body.get("code") or code)
                 message = str(error_body.get("message") or message)
-                details = error_body.get("details")
-                if isinstance(details, dict):
-                    LOGGER.warning("png_renderer_failed code=%s details=%s", code, details)
         except json.JSONDecodeError:
             if completed.stderr.strip():
                 message = completed.stderr.strip()[:300]
@@ -197,7 +177,6 @@ def call_png_renderer(payload: dict[str, Any]) -> list[dict[str, Any]]:
             "render_dependency_unavailable": HTTPStatus.SERVICE_UNAVAILABLE,
             "template_not_found": HTTPStatus.BAD_REQUEST,
             "slide_text_too_long": HTTPStatus.UNPROCESSABLE_ENTITY,
-            "slide_layout_overflow": HTTPStatus.UNPROCESSABLE_ENTITY,
             "no_slides": HTTPStatus.UNPROCESSABLE_ENTITY,
             "invalid_slide": HTTPStatus.UNPROCESSABLE_ENTITY,
         }
@@ -231,7 +210,6 @@ def render_content_png(item_id: str, body: dict[str, Any]) -> dict[str, Any]:
     record = STORE.get(item_id)
     slides = validate_renderable_content(record)
     LOGGER.info("content_loaded content_id=%s slides=%d", item_id, len(slides))
-    log_render_preflight_metrics(slides)
 
     existing = latest_completed_render(
         record,

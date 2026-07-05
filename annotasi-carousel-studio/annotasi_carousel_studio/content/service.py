@@ -83,69 +83,77 @@ def update_content_status(item_id: str, body: dict[str, Any]) -> dict[str, Any]:
     return get_content_status(item_id)
 
 
-def edit_slide(item_id: str, slide_number: int, body: dict[str, Any]) -> dict[str, Any]:
-    record = STORE.get(item_id)
+def edit_slide(content_id: str, slide_number: int, body: dict[str, Any]) -> dict[str, Any]:
+    record = STORE.get(content_id)
+
     content = record.get("content")
     if not isinstance(content, dict):
-        raise AppError(HTTPStatus.UNPROCESSABLE_ENTITY, "invalid_content", "Content package is invalid.")
+        raise AppError(HTTPStatus.NOT_FOUND, "content_not_found", "Content payload not found.")
+
     slides = content.get("slides")
     if not isinstance(slides, list) or not slides:
-        raise AppError(HTTPStatus.UNPROCESSABLE_ENTITY, "no_slides", "Content package has no slides.")
-    if not 1 <= slide_number <= len(slides):
-        raise AppError(HTTPStatus.NOT_FOUND, "slide_not_found", "Slide number was not found.")
+        raise AppError(HTTPStatus.UNPROCESSABLE_ENTITY, "slides_not_found", "Content has no slides.")
+
+    if slide_number < 1 or slide_number > len(slides):
+        raise AppError(HTTPStatus.NOT_FOUND, "slide_not_found", "Slide not found.")
+
     slide = slides[slide_number - 1]
     if not isinstance(slide, dict):
-        raise AppError(HTTPStatus.UNPROCESSABLE_ENTITY, "invalid_slide", f"Slide {slide_number} is invalid.")
+        raise AppError(HTTPStatus.UNPROCESSABLE_ENTITY, "invalid_slide", "Slide payload is invalid.")
 
-    edited_by = str(body.get("editedBy") or "internal")
-    changed_fields = []
+    old_slide = dict(slide)
+    edited_by = str(body.get("editedBy") or "annotasi").strip() or "annotasi"
+
     if "text" in body:
-        new_text = str(body.get("text") or "").strip()
-        if not new_text:
-            raise AppError(HTTPStatus.BAD_REQUEST, "empty_edit_text", "Slide text cannot be empty.")
-        old_text = str(slide.get("text") or "")
-        slide["text"] = new_text
-        append_edit_history(record, f"slides.{slide_number}.text", old_text, new_text, edited_by)
-        changed_fields.append("text")
-    if "visualDirection" in body:
-        new_visual = str(body.get("visualDirection") or "").strip()
-        old_visual = str(slide.get("visualDirection") or "")
-        slide["visualDirection"] = new_visual
-        append_edit_history(record, f"slides.{slide_number}.visualDirection", old_visual, new_visual, edited_by)
-        changed_fields.append("visualDirection")
-    if "type" in body:
-        new_type = str(body.get("type") or "").strip()
-        if new_type not in {"hook", "body", "closing"}:
-            raise AppError(HTTPStatus.BAD_REQUEST, "invalid_slide_type", "Slide type is invalid.")
-        old_type = str(slide.get("type") or "")
-        slide["type"] = new_type
-        append_edit_history(record, f"slides.{slide_number}.type", old_type, new_type, edited_by)
-        changed_fields.append("type")
-    if not changed_fields:
-        raise AppError(HTTPStatus.BAD_REQUEST, "missing_edit_fields", "Provide text, visualDirection, or type to edit.")
+        text = str(body.get("text") or "").strip()
+        if not text:
+            raise AppError(HTTPStatus.BAD_REQUEST, "invalid_slide_text", "Slide text cannot be empty.")
+        slide["text"] = text
 
-    mark_render_stale(record, png=True, video=True, audio=True)
-    set_workflow_status(record, "needs_review")
-    STORE.save(record)
-    LOGGER.info("slide_edited content_id=%s slide=%d fields=%s", item_id, slide_number, ",".join(changed_fields))
-    text = "\n".join(
-        [
-            "Slide updated.",
-            "",
-            "Content ID:",
-            item_id,
-            "",
-            "Slide:",
-            str(slide_number),
-            "",
-            "Status:",
-            "needs_review",
-            "",
-            "Reminder:",
-            "Render ulang PNG dan video setelah edit.",
-        ]
+    if "visualDirection" in body:
+        visual_direction = str(body.get("visualDirection") or "").strip()
+        if not visual_direction:
+            raise AppError(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_visual_direction",
+                "Slide visualDirection cannot be empty.",
+            )
+        slide["visualDirection"] = visual_direction
+
+    if "type" in body:
+        slide_type = str(body.get("type") or "").strip()
+        if slide_type not in {"hook", "body", "closing"}:
+            raise AppError(HTTPStatus.BAD_REQUEST, "invalid_slide_type", "Slide type must be hook, body, or closing.")
+        slide["type"] = slide_type
+
+    record["updatedAt"] = now_iso()
+
+    workflow = ensure_workflow(record)
+    workflow["status"] = "needs_review"
+    workflow["reviewStatus"] = "needs_review"
+
+    mark_render_stale(record)
+    mark_packages_stale(record)
+
+    append_edit_history(
+        record,
+        "slides",
+        json.dumps(old_slide, ensure_ascii=False),
+        json.dumps(slide, ensure_ascii=False),
+        edited_by,
     )
-    return {"contentId": item_id, "slideNumber": slide_number, "summary": workflow_summary(record), "telegramMessages": split_telegram_message(text)}
+
+    STORE.save(record)
+
+    return {
+        "contentId": content_id,
+        "slideNumber": slide_number,
+        "slide": slide,
+        "summary": workflow_summary(record),
+        "telegramMessages": [
+            f"Slide {slide_number} updated.\n\nContent ID:\n{content_id}\n\nNext action:\n/review {content_id}"
+        ],
+    }
 
 
 def edit_caption(item_id: str, body: dict[str, Any]) -> dict[str, Any]:

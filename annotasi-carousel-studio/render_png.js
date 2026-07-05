@@ -17,11 +17,11 @@ function readStdin() {
 }
 
 function writeError(code, message, details) {
-  const body = { code, message };
-  if (details && typeof details === "object") {
-    body.details = details;
+  const payload = { code, message };
+  if (details) {
+    payload.details = details;
   }
-  process.stdout.write(JSON.stringify(body));
+  process.stdout.write(JSON.stringify(payload));
 }
 
 function loadPlaywright() {
@@ -60,12 +60,12 @@ function normalizeSlide(slide, index, total) {
 
 function fontRules(type) {
   if (type === "hook") {
-    return { start: 76, min: 38 };
+    return { start: 76, min: 58 };
   }
   if (type === "closing") {
-    return { start: 64, min: 34 };
+    return { start: 64, min: 48 };
   }
-  return { start: 62, min: 36 };
+  return { start: 62, min: 46 };
 }
 
 function slideHtml(payload, slide, index, total) {
@@ -260,78 +260,98 @@ function slideHtml(payload, slide, index, total) {
 }
 
 async function ensureTextFits(page, slide) {
-  const fit = await page.evaluate((slideType) => {
+  const fit = await page.evaluate(() => {
     const text = document.querySelector(".slide-text");
     const content = document.querySelector(".content");
+    const title = document.querySelector(".title");
+    const visualNote = document.querySelector(".visual-note");
+    const cta = document.querySelector(".cta");
+    const source = document.querySelector(".source");
+
     if (!text || !content) {
-      return { ok: false, fontSize: 0 };
+      return { ok: false, reason: "missing_required_elements" };
     }
 
-    const controls = [
-      { element: text, min: Number(text.getAttribute("data-min-font") || 36) },
-      { element: document.querySelector(".title"), min: 22 },
-      { element: document.querySelector(".visual-note"), min: 18 },
-      { element: document.querySelector(".cta"), min: 22 },
-      { element: document.querySelector(".source"), min: 16 },
-    ].filter((item) => item.element);
+    const start = Number(text.getAttribute("data-start-font") || 60);
+    let size = start;
 
-    const metrics = () => ({
-      ok: text.scrollHeight <= text.clientHeight && content.scrollHeight <= content.clientHeight,
-      fontSize: Number.parseFloat(window.getComputedStyle(text).fontSize) || 0,
+    let min = 36;
+    if (document.querySelector(".hook")) {
+      min = 34;
+    }
+    if (document.querySelector(".closing")) {
+      min = 32;
+    }
+
+    content.style.maxHeight = "none";
+    text.style.maxHeight = "none";
+
+    function textOverflows() {
+      return text.scrollHeight > text.clientHeight;
+    }
+
+    function contentOverflows() {
+      return content.scrollHeight > content.clientHeight;
+    }
+
+    while ((textOverflows() || contentOverflows()) && size > min) {
+      size -= 2;
+      text.style.fontSize = `${size}px`;
+
+      if (title) {
+        const titleSize = Math.max(24, Math.round(size * 0.45));
+        title.style.fontSize = `${titleSize}px`;
+      }
+
+      if (visualNote) {
+        const visualSize = Math.max(18, Math.round(size * 0.34));
+        visualNote.style.fontSize = `${visualSize}px`;
+        visualNote.style.marginTop = "20px";
+      }
+
+      if (cta) {
+        const ctaSize = Math.max(22, Math.round(size * 0.42));
+        cta.style.fontSize = `${ctaSize}px`;
+        cta.style.marginTop = "22px";
+      }
+
+      if (source) {
+        const sourceSize = Math.max(16, Math.round(size * 0.30));
+        source.style.fontSize = `${sourceSize}px`;
+        source.style.marginTop = "14px";
+      }
+    }
+
+    if (contentOverflows() && visualNote) {
+      visualNote.style.display = "none";
+    }
+
+    if (contentOverflows() && source) {
+      source.style.display = "none";
+    }
+
+    if (contentOverflows() && cta) {
+      cta.style.marginTop = "16px";
+    }
+
+    return {
+      ok: !textOverflows() && !contentOverflows(),
+      fontSize: size,
+      textLength: text.textContent.length,
+      textWords: text.textContent.trim().split(/\s+/).filter(Boolean).length,
       textScrollHeight: text.scrollHeight,
       textClientHeight: text.clientHeight,
       contentScrollHeight: content.scrollHeight,
       contentClientHeight: content.clientHeight,
-    });
-
-    let current = metrics();
-    while (!current.ok) {
-      let changed = false;
-      for (const item of controls) {
-        const currentSize = Number.parseFloat(window.getComputedStyle(item.element).fontSize) || 0;
-        if (currentSize > item.min) {
-          item.element.style.fontSize = `${Math.max(item.min, currentSize - 2)}px`;
-          changed = true;
-        }
-      }
-      current = metrics();
-      if (!changed) {
-        break;
-      }
-    }
-
-    const visualNote = document.querySelector(".visual-note");
-    if (!current.ok && visualNote) {
-      visualNote.style.display = "none";
-      current = metrics();
-    }
-
-    const source = document.querySelector(".source");
-    if (!current.ok && slideType === "closing" && source) {
-      source.style.display = "none";
-      current = metrics();
-    }
-
-    return current;
-  }, slide.type);
-  if (!fit.ok) {
-    const textWords = slide.text.trim() ? slide.text.trim().split(/\s+/).length : 0;
-    const textIsDirectCause = fit.textScrollHeight > fit.textClientHeight;
-    const error = new Error(
-      textIsDirectCause
-        ? `Slide ${slide.slideNumber} text is too long to render without overflow.`
-        : `Slide ${slide.slideNumber} layout overflows. Shorten slide text, title, visual direction, CTA, or source credit.`
-    );
-    error.code = textIsDirectCause ? "slide_text_too_long" : "slide_layout_overflow";
-    error.details = {
-      slideNumber: slide.slideNumber,
-      textLength: slide.text.length,
-      textWords,
-      contentScrollHeight: fit.contentScrollHeight,
-      contentClientHeight: fit.contentClientHeight,
-      textScrollHeight: fit.textScrollHeight,
-      textClientHeight: fit.textClientHeight,
     };
+  });
+
+  if (!fit.ok) {
+    const error = new Error(
+      `Slide ${slide.slideNumber} layout overflows. Shorten slide text, title, visual direction, CTA, or source credit.`
+    );
+    error.code = "slide_layout_overflow";
+    error.details = fit;
     throw error;
   }
 }

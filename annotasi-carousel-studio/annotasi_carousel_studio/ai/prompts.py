@@ -88,11 +88,7 @@ JSON schema:
 
 Rules:
 - slides must contain 5 to 8 slides; prefer exactly {slide_count}.
-- title must be 7 words or fewer.
-- each slide text must be 8 to 10 words or fewer.
-- each visualDirection must be 8 words or fewer.
-- callToAction must be 8 words or fewer.
-- sourceCreditSuggestion must be 8 words or fewer.
+- each slide text must be 25 words or fewer.
 - use hook for slide 1, closing for the final slide, and body for the middle slides.
 - hashtags should be relevant and not excessive.
 - voiceover should fit roughly 30 to 60 seconds.
@@ -202,11 +198,6 @@ Rules:
 - Always include a source credit suggestion.
 - Keep tone calm, reflective, respectful, not clickbait.
 - Default to 7 slides, each slide short and readable.
-- Title must be 7 words or fewer.
-- Each slide text must be 8 to 10 words or fewer.
-- Each visualDirection must be 8 words or fewer.
-- callToAction must be 8 words or fewer.
-- sourceCreditSuggestion must be 8 words or fewer.
 
 Return JSON only using this schema:
 {{
@@ -362,11 +353,6 @@ Rules:
 - Do not add claims beyond the source context.
 - Keep calm, reflective, respectful, not clickbait.
 - Include source credit suggestion.
-- Title must be 7 words or fewer.
-- Each slide text must be 8 to 10 words or fewer.
-- Each visualDirection must be 8 words or fewer.
-- callToAction must be 8 words or fewer.
-- sourceCreditSuggestion must be 8 words or fewer.
 - Content status will be needs_review; do not auto-approve.
 
 Return JSON only using this schema:
